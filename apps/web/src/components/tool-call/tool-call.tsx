@@ -1,4 +1,5 @@
 import { Icon } from '@/components/icon'
+import { PackageIcon } from '@/components/package-icon/package-icon'
 import { useId, useMemo, useState, type CSSProperties, type Ref } from 'react'
 import { clsx } from 'clsx'
 
@@ -13,6 +14,8 @@ import { getToolOutputFormat, toToolContent, toToolDisplayContent, toToolInput }
 import { getToolChanges, hasToolChanges } from '@/utils/tool-changes'
 import { prefetchToolDiff, ToolChanges, ToolOutput } from './tool-output'
 import { useOpenToolDetails } from '@/components/activity-details/activity-details-provider'
+import { PreparationStatus } from '../../../../../aurora/src/v2/contracts/preparation'
+import { ToolPreparation } from './tool-preparation'
 
 import './tool-call.sass'
 
@@ -107,7 +110,8 @@ export function ToolCall({ toolCall, measureRef, rowIndex, style }: ToolCallProp
               active={isActive}
               className="tool-call-heading-layer"
             >
-              <Icon name={toolCall.toolIconName} fallbackName={toolCall.toolkitIconName} className="tool-call-tool-icon" />
+              <PackageIcon logoUrl={toolCall.toolLogo?.url} maskMode={toolCall.toolLogo?.mode} iconName={toolCall.toolIconName}
+                fallbackName={toolCall.toolkitIconName} className="tool-call-tool-icon" />
               <span className="tool-call-title">{toolCall.toolCallTitle || formatFunctionName(toolCall.functionName)}</span>
               {toolCall.status === 'error' && (
                 <Icon name="close-line" className="tool-call-error-indicator" />
@@ -128,6 +132,8 @@ export function ToolCall({ toolCall, measureRef, rowIndex, style }: ToolCallProp
         </button>
         <ActivityTimestamp timestamp={toolCall.startedAt ?? toolCall.preparationStartedAt} />
       </div>
+      {toolCall.preparation && (isActive || isExpanded || toolCall.preparation.status === PreparationStatus.Failed ||
+        toolCall.preparation.status === PreparationStatus.Cancelled) && <ToolPreparation preparation={toolCall.preparation} />}
       <Collapse id={detailsId} isOpen={isExpanded}>
         <ActivityDetails title={technicalTitle} onViewDetails={openDetails} notice={
           disclosure.isError && <button type="button" onClick={() => void disclosure.refetch()}>Retry loading tool details</button>

@@ -52,6 +52,7 @@ export interface HTTPPluginToolCall {
   status: 'preparing' | 'running' | 'success' | 'error'
   toolkit_icon_name?: string
   tool_icon_name?: string
+  tool_logo?: import('@@/aurora/src/contracts/package-logo').MaskedPackageLogo
   observation?: string
   started_at?: number
   preparation_started_at?: number
@@ -63,6 +64,7 @@ export interface HTTPPluginToolCall {
   command_output?: string
   last_output_at?: number
   progress_message?: string
+  preparation?: import('@@/aurora/src/v2/contracts/preparation').ToolPreparationSnapshot
   error_message?: string
   skill_id?: string
   native_skill_path?: string
@@ -254,6 +256,7 @@ export interface HTTPPluginConversationSessionMutationResult {
 }
 
 export type HTTPPluginAgentEventType =
+  | 'answer_parts'
   | 'fyi'
   | 'inference_activity'
   | 'text_stream'

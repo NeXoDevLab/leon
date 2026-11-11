@@ -15,7 +15,9 @@ import type { LLMAnswerMetrics, MessageLog } from '@/types'
 import {
   getActiveTurnInference,
   getActiveConversationSessionId,
+  getActiveConversationResponseId,
   recordTurnInference,
+  runWithConversationResponse,
   runWithConversationSession
 } from '@/core/session-manager/session-context'
 import {
@@ -25,6 +27,7 @@ import {
 } from '@/core/llm-manager/inference-metadata'
 import { runWithProfileContext } from '@/core/profile-runtime/profile-context'
 import { ConversationRepository } from '@/core/session-manager/conversation-repository'
+import { LogoMaskMode } from '../../../aurora/src/contracts/package-logo'
 
 const sessions = vi.hoisted(() => ({
   root: '', selectedSession: 'pulse-session', repository: null as ConversationRepository | null
@@ -222,6 +225,20 @@ describe('conversation trace persistence', () => {
 
     await logger.upsert(message, { sessionId: 'first' })
     await runWithConversationSession({ sessionId: 'first' }, async () => {
+      await runWithConversationResponse('first-reply', async () => {
+        await Promise.resolve()
+        expect(getActiveConversationResponseId()).toBe('first-reply')
+        await runWithConversationSession({ sessionId: 'first' }, async () => {
+          expect(getActiveConversationResponseId()).toBe('first-reply')
+        })
+        await runWithConversationSession({ sessionId: 'second' }, async () => {
+          expect(getActiveConversationResponseId()).toBeUndefined()
+        })
+        await runWithProfileContext({ profileName: 'another-profile' }, async () => {
+          expect(getActiveConversationResponseId()).toBeUndefined()
+        })
+      })
+      expect(getActiveConversationResponseId()).toBeUndefined()
       await logger.upsert(message, { sessionId: 'first' })
       recordTurnInference(account)
       recordTurnInference(account)
@@ -280,6 +297,7 @@ describe('conversation trace persistence', () => {
     })
     const widget = {
       id: 'connection-session-spotify',
+      responseId: 'first-reply',
       widget: 'ConnectionWidget',
       actionName: '',
       onFetch: null,
@@ -302,6 +320,7 @@ describe('conversation trace persistence', () => {
     const logs = await logger.loadAll({ sessionId: 'first' })
 
     expect(logs).toHaveLength(1)
+    expect(logs[0]?.widget?.responseId).toBe('first-reply')
     expect(
       logs.filter(ConversationHistoryHelper.isAddedToHistory)
     ).toHaveLength(0)
@@ -442,6 +461,8 @@ describe('conversation trace persistence', () => {
           toolCallTitle: 'Look up the requested value',
           toolkitName: 'Test Toolkit',
           toolName: 'Official Lookup',
+          toolkitIconName: 'tools-line',
+          toolIconName: 'mail-line',
           durationMs: 138
         }],
         progressMessages: [{
@@ -463,6 +484,12 @@ describe('conversation trace persistence', () => {
     expect(reloaded.filter(ConversationHistoryHelper.isAddedToHistory)).toEqual([])
     expect(ConversationHistoryHelper.toHistoryItems(reloaded, { supportsWidgets: true })[0]?.agentResponseTrace)
       .toEqual(draft.agentResponseTrace)
+    const logo = { url: 'tools/test.lookup/assets/logo.svg', mode: LogoMaskMode.Alpha }
+    const projected = ConversationHistoryHelper.toHistoryItems(reloaded, {
+      supportsWidgets: true, resolveToolIconNames: () => ({ toolLogo: logo })
+    })
+    expect(projected[0]?.agentResponseTrace?.toolCalls[0]?.toolLogo).toEqual(logo)
+    expect(reloaded[0]?.agentResponseTrace?.toolCalls[0]).not.toHaveProperty('toolLogo')
 
     const activity = {
       ...draft,

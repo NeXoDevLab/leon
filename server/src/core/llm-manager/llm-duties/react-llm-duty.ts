@@ -7,6 +7,7 @@ import type { CompletionAccounting, UsageAccounting } from '@/core/llm-manager/l
 import { captureContextUsage, type ContextUsageMetrics } from '@/core/llm-manager/llm-usage/context-usage'
 import { resolveModelContextWindowTokens } from '@/core/llm-manager/model-context-windows'
 import { randomUUID } from 'node:crypto'
+import { presentAurora, finishAuroraAnswer } from '@/core/aurora/answer-presentation'
 import { AsyncResource } from 'node:async_hooks'
 import { ModelResponseState, type ModelResponseStatus } from '@/core/leon-interface/types'
 import type { AgentSkillSnapshot } from '@/core/llm-manager/agent-progress-contract'
@@ -56,7 +57,7 @@ import { getConnectionRequirements } from '@/core/connections/connection-catalog
 import { CONNECTION_SETUP_TOOL_NAME } from '@/core/connections/connection-tool'
 import { CONFIG_MANAGER } from '@/config'
 import { CONVERSATION_SESSION_MANAGER } from '@/core/session-manager'
-import { getActiveConversationSessionId } from '@/core/session-manager/session-context'
+import { getActiveConversationSessionId, runWithConversationResponse } from '@/core/session-manager/session-context'
 import { LLAMACPP_MAX_OUTPUT_TOKENS } from '@/constants'
 
 const TRACE_SAVE_INTERVAL_MS = 1_000
@@ -138,7 +139,10 @@ import {
 import type { AgentCallableFunction, AgentLoopResult } from './react-llm-duty/agent-loop'
 import { appendAgentRuntimeContext, buildToolkitContextSection } from './react-llm-duty/agent-helpers'
 import { AgentRunBudget } from './react-llm-duty/agent-run-budget'
-import { runTurnPhase, TurnPhase, setTurnPhaseGoal, observeTurnInferences } from '../turn-timing'
+import { runTurnPhase, TurnPhase, setTurnPhaseGoal, observeTurnActivities, getTurnTimings } from '../turn-timing'
+import { isToolPreparationPhase } from '../turn-timing-contract'
+import { CATALOG_SEARCH_TOOL_NAME } from '@/core/tool-manager/catalog/agent-catalog'
+import { AURORA_LOADER_NAME, AURORA_PREVIEW_NAME, AURORA_PRESENT_NAME } from '@/core/aurora/agent-ui-contract'
 import {
   type AccumulatedLLMMetricsState,
   type FinalAnswerMetricsSnapshot,
@@ -170,7 +174,11 @@ const TOOL_REQUEST_GOALS: ReadonlyMap<string, TurnPhase> = new Map([
   [AGENT_PLAN_TOOL_NAME, TurnPhase.Plan],
   [AGENT_CLARIFICATION_TOOL_NAME, TurnPhase.Clarification],
   [AGENT_CANCELLATION_TOOL_NAME, TurnPhase.Cancellation],
-  [CONNECTION_SETUP_TOOL_NAME, TurnPhase.Connection]
+  [CONNECTION_SETUP_TOOL_NAME, TurnPhase.Connection],
+  [CATALOG_SEARCH_TOOL_NAME, TurnPhase.CatalogSearch],
+  [AURORA_LOADER_NAME, TurnPhase.VisualSetup],
+  [AURORA_PREVIEW_NAME, TurnPhase.Visual],
+  [AURORA_PRESENT_NAME, TurnPhase.VisualPresentation]
 ])
 
 enum SkillActivityStatus {
@@ -326,18 +334,20 @@ export class ReActLLMDuty extends LLMDuty {
   }
 
   public async execute(): Promise<LLMDutyResult | null> {
-    return observeTurnInferences((activity) => {
+    const responseId = this.responseId || randomUUID()
+
+    return runWithConversationResponse(responseId, () => observeTurnActivities((activity) => {
       this.reportProgressEvent({ type: 'inference_activity', activity })
     }, async () => {
       try {
-        return await this.executeTurn()
+        return await this.executeTurn(responseId)
       } finally {
         EXPERIENCE_MANAGER.releaseTask(this.experienceTaskId)
       }
-    })
+    }))
   }
 
-  private async executeTurn(): Promise<LLMDutyResult | null> {
+  private async executeTurn(traceId: string): Promise<LLMDutyResult | null> {
     this.signal?.throwIfAborted()
     LogHelper.title(this.name)
     LogHelper.info('Executing...')
@@ -374,7 +384,6 @@ export class ReActLLMDuty extends LLMDuty {
     this.hasFinalizedAnswer = false
     this.finalResponseIntent = 'answer'
     this.lastExecutionHistory = []
-    const traceId = this.responseId || randomUUID()
     this.responseTraceCollector.reset(traceId)
     // Capture the session and profile-bound writer before any deferred saves.
     const sessionId = CONVERSATION_SESSION_MANAGER.getCurrentSessionId()
@@ -388,7 +397,7 @@ export class ReActLLMDuty extends LLMDuty {
     }, { sessionId, activity: true })
     this.reportProgressEvent({
       type: 'reasoning_summary',
-      summary: 'Understanding your request'
+      summary: 'Working'
     })
 
     // Background duties without a bound conversation must not consume messages
@@ -413,6 +422,7 @@ export class ReActLLMDuty extends LLMDuty {
         continuation?.trackedSteps.map((step) => ({ ...step })) || []
       let hasPlanningWidget = trackedSteps.length > 0
       const executionHistory: ExecutionRecord[] = []
+      let hasAurora = false
       const caller = this.createLLMCaller()
       if (continuation?.activeSkillId) {
         const skill = continuation.activeSkillId.startsWith(EXPERIENCE_PREFIX)
@@ -444,6 +454,9 @@ export class ReActLLMDuty extends LLMDuty {
         answer: string,
         intent: FinalResponseSignal['intent']
       ): LLMDutyResult => {
+        if (hasAurora) {
+          finishAuroraAnswer(sessionId, traceId, answer, intent === 'answer' || intent === 'clarification')
+        }
         this.hasFinalizedAnswer = true
         this.finalResponseIntent = intent
         this.lastExecutionHistory = executionHistory.map((item) => ({
@@ -477,7 +490,8 @@ export class ReActLLMDuty extends LLMDuty {
         loadedState?.toolOrder
           ? {
               toolOrder: loadedState.toolOrder,
-              planTracking: loadedState.planTracking ?? false
+              planTracking: loadedState.planTracking ?? false,
+              ...(loadedState.auroraMode ? { auroraMode: loadedState.auroraMode } : {})
             }
           : undefined
       ))
@@ -630,11 +644,17 @@ export class ReActLLMDuty extends LLMDuty {
           loadedFunctionNames: [...catalog.functionsByToolName.values()].map((fn) => fn.qualifiedName),
           toolOrder: catalog.tools.map((tool) => tool.function.name),
           planTracking: catalog.planTracking === true,
+          ...(catalog.auroraMode ? { auroraMode: catalog.auroraMode } : {}),
           activeSkillId: caller.agentSkillContext?.id ?? null
         }))
       }
 
       const result = await runAgentLoop({
+        onPresentUI: async (spec, purpose, surfaceId) => {
+          const surface = await presentAurora(sessionId, traceId, spec, purpose, surfaceId)
+          hasAurora = true
+          return surface.id
+        },
         ...(agentTurn ? {
           drainOwnerMessages: agentTurn.drainOwnerMessages,
           getOwnerMessageSignal: agentTurn.getOwnerMessageSignal
@@ -884,7 +904,8 @@ export class ReActLLMDuty extends LLMDuty {
               (fn) => fn.qualifiedName
             ),
             toolOrder: catalog.tools.map((tool) => tool.function.name),
-            planTracking: catalog.planTracking === true
+            planTracking: catalog.planTracking === true,
+            ...(catalog.auroraMode ? { auroraMode: catalog.auroraMode } : {})
           },
           StringHelper.normalizeUserFacingText(result.answer)
         )
@@ -964,6 +985,9 @@ export class ReActLLMDuty extends LLMDuty {
         event = {
           ...event,
           toolCall: {
+            ...(display.toolkitIconName ? { toolkitIconName: display.toolkitIconName } : {}),
+            ...(display.toolIconName ? { toolIconName: display.toolIconName } : {}),
+            ...(display.toolLogo ? { toolLogo: display.toolLogo } : {}),
             ...event.toolCall,
             toolkitName: event.toolCall.toolkitName || display.toolkitName,
             toolName: event.toolCall.toolName || display.toolName
@@ -2427,7 +2451,8 @@ export class ReActLLMDuty extends LLMDuty {
     const otherProcessingDurationMs = measureOtherProcessingDuration(
       this.executionStartedAt,
       generationMetrics.durationMs,
-      [...this.measuredModelIntervals, ...this.lastExecutionHistory]
+      [...this.measuredModelIntervals, ...this.lastExecutionHistory,
+        ...getTurnTimings().filter((timing) => timing.kind === 'phase' && isToolPreparationPhase(timing.goal))]
     )
     const llmMetrics = {
       ...generationMetrics,

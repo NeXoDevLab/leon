@@ -56,11 +56,13 @@ export function serializeAgentTrace(
       ...(toolCall.toolIconName
         ? { tool_icon_name: toolCall.toolIconName }
         : {}),
+      ...(toolCall.toolLogo ? { tool_logo: toolCall.toolLogo } : {}),
       ...(toolCall.input !== undefined ? { input: toolCall.input } : {}),
       ...(toolCall.output !== undefined ? { output: toolCall.output } : {}),
       ...(toolCall.commandOutput !== undefined ? { command_output: toolCall.commandOutput } : {}),
       ...(toolCall.lastOutputAt !== undefined ? { last_output_at: toolCall.lastOutputAt } : {}),
       ...(toolCall.progressMessage ? { progress_message: toolCall.progressMessage } : {}),
+      ...(toolCall.preparation ? { preparation: toolCall.preparation } : {}),
       ...(toolCall.stepLabel ? { step_label: toolCall.stepLabel } : {}),
       ...(toolCall.errorMessage
         ? { error_message: toolCall.errorMessage }
@@ -132,11 +134,13 @@ export function deserializeAgentTrace(
       ...(toolCall.tool_icon_name
         ? { toolIconName: toolCall.tool_icon_name }
         : {}),
+      ...(toolCall.tool_logo ? { toolLogo: toolCall.tool_logo } : {}),
       ...(toolCall.input !== undefined ? { input: toolCall.input } : {}),
       ...(toolCall.output !== undefined ? { output: toolCall.output } : {}),
       ...(toolCall.command_output !== undefined ? { commandOutput: toolCall.command_output } : {}),
       ...(toolCall.last_output_at !== undefined ? { lastOutputAt: toolCall.last_output_at } : {}),
       ...(toolCall.progress_message ? { progressMessage: toolCall.progress_message } : {}),
+      ...(toolCall.preparation ? { preparation: toolCall.preparation } : {}),
       ...(toolCall.step_label ? { stepLabel: toolCall.step_label } : {}),
       ...(toolCall.error_message
         ? { errorMessage: toolCall.error_message }
