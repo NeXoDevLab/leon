@@ -4,11 +4,13 @@ import { InferencePurpose, LLMDuties } from '../../../../server/src/core/llm-man
 interface ProcessingCategory {
   label: string
   iconName: string
+  isGeneric?: boolean
 }
 
 const DEFAULT_CATEGORY: ProcessingCategory = {
   label: 'Processed request for',
-  iconName: 'cpu-line'
+  iconName: 'cpu-line',
+  isGeneric: true
 }
 
 const CATEGORIES: Readonly<Partial<Record<string, ProcessingCategory>>> = {
@@ -21,6 +23,10 @@ const CATEGORIES: Readonly<Partial<Record<string, ProcessingCategory>>> = {
   [TurnPhase.Clarification]: { label: 'Requested clarification in', iconName: 'question-mark' },
   [TurnPhase.Cancellation]: { label: 'Acknowledged cancellation in', iconName: 'close-circle-line' },
   [TurnPhase.Connection]: { label: 'Requested connection setup in', iconName: 'plug-line' },
+  [TurnPhase.CatalogSearch]: { label: 'Checked tool catalog in', iconName: 'search-line' },
+  [TurnPhase.VisualSetup]: { label: 'Prepared visual guidance in', iconName: 'layout-4-line' },
+  [TurnPhase.Visual]: { label: 'Prepared visual source in', iconName: 'layout-4-line' },
+  [TurnPhase.VisualPresentation]: { label: 'Prepared visual presentation in', iconName: 'layout-4-line' },
   [TurnPhase.Answer]: { label: 'Generated answer in', iconName: 'pencil-ai-line' },
   [TurnPhase.Review]: { label: 'Reviewed for', iconName: 'search-eye-line' },
   [TurnPhase.Inspection]: { label: 'Inspected images in', iconName: 'eye-2-line' },
@@ -40,9 +46,21 @@ const CATEGORIES: Readonly<Partial<Record<string, ProcessingCategory>>> = {
 }
 
 /**
- * Keeps inference labels and icons consistent without guessing unknown goals.
+ * Keeps model and preparation labels consistent without guessing unknown goals.
  * Categories describe existing work; they never schedule additional inference.
  */
-export function getProcessingCategory(goal: string): ProcessingCategory {
+export function getProcessingCategory(goal: string, subject = 'MCP server', outcome = 'completed'): ProcessingCategory {
+  if (goal === TurnPhase.MCPConnection) {
+    return {
+      label: outcome === 'completed' ? `Connected to ${subject} in` : `Tried connecting to ${subject} for`,
+      iconName: 'plug-line'
+    }
+  }
+  if (goal === TurnPhase.MCPDiscovery) {
+    return {
+      label: outcome === 'completed' ? `Loaded ${subject} tools in` : `Tried loading ${subject} tools for`,
+      iconName: 'stack-line'
+    }
+  }
   return Object.hasOwn(CATEGORIES, goal) ? CATEGORIES[goal]! : DEFAULT_CATEGORY
 }

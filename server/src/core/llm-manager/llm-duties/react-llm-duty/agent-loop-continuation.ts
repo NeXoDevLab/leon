@@ -1,4 +1,5 @@
 import type { AgentToolTranscriptMessage } from '@/core/llm-manager/types'
+import { isAuroraMode, type AuroraMode } from '@/core/aurora/agent-ui-contract'
 
 import type { ExecutionRecord, TrackedPlanStep } from './agent-types'
 import {
@@ -9,7 +10,6 @@ import {
 import { parseToolCallArguments } from './agent-utils'
 
 const AGENT_CONTINUATION_VERSION = 5
-const AGENT_CONTINUATION_TTL_MS = 30 * 60 * 1_000
 const AGENT_CONTINUITY_EXECUTION_LIMIT = 6
 const AGENT_CONTINUITY_ARTIFACT_LIMIT = 16
 const AGENT_CONTINUITY_OBJECTIVE_MAX_CHARS = 1_200
@@ -31,6 +31,7 @@ export interface AgentLoopContinuationState {
   loadedToolNames?: string[]
   toolOrder?: string[]
   planTracking?: boolean
+  auroraMode?: AuroraMode
   transcript: AgentToolTranscriptMessage[]
   activeSkillId: string | null
 }
@@ -210,7 +211,9 @@ function removePreviousContinuityCheckpoint(
 export async function buildAgentContinuationTranscript(
   transcript: AgentToolTranscriptMessage[],
   summarize: (history: string) => Promise<string | null>,
-  checkpointInput?: AgentContinuityCheckpointInput
+  checkpointInput?: AgentContinuityCheckpointInput,
+  forceCompaction = false,
+  recentExchangeLimit?: number
 ): Promise<AgentToolTranscriptMessage[]> {
   const rawTranscript = removePreviousContinuityCheckpoint(transcript)
   const checkpoint = checkpointInput
@@ -223,7 +226,9 @@ export async function buildAgentContinuationTranscript(
     return checkpoint ? [...rawTranscript, checkpoint] : rawTranscript
   }
 
-  const parts = splitAgentTranscriptForSummary(rawTranscript)
+  const parts = splitAgentTranscriptForSummary(
+    rawTranscript, forceCompaction, recentExchangeLimit
+  )
   if (!parts) return checkpoint ? [...rawTranscript, checkpoint] : rawTranscript
 
   // The summary needs textual evidence, not image bytes or opaque replay data.
@@ -278,6 +283,7 @@ export function createAgentLoopContinuationState(
     planWidgetId: string
     toolOrder?: string[]
     planTracking?: boolean
+    auroraMode?: AuroraMode
   }
 ): AgentLoopContinuationState {
   const loadedToolkitIds = [...params.loadedToolkitIds]
@@ -294,6 +300,7 @@ export function createAgentLoopContinuationState(
     ...(params.planTracking !== undefined
       ? { planTracking: params.planTracking }
       : {}),
+    ...(params.auroraMode ? { auroraMode: params.auroraMode } : {}),
     ...(params.loadedToolNames ? { loadedToolNames: [...params.loadedToolNames] } : {}),
     ...(params.loadedFunctionNames
       ? { loadedFunctionNames: [...params.loadedFunctionNames] }
@@ -304,7 +311,8 @@ export function createAgentLoopContinuationState(
 }
 
 /**
- * Rejects stale or incompatible continuation payloads before resuming.
+ * Rejects incompatible checkpoints while retaining unfinished work across waits.
+ * Live observations must be refreshed by the resumed task before acting on them.
  */
 export function isAgentLoopContinuationStateValid(
   state: AgentLoopContinuationState
@@ -312,7 +320,6 @@ export function isAgentLoopContinuationStateValid(
   return (
     state.version === AGENT_CONTINUATION_VERSION &&
     Number.isFinite(state.createdAt) &&
-    Date.now() - state.createdAt <= AGENT_CONTINUATION_TTL_MS &&
     typeof state.originalInput === 'string' &&
     typeof state.clarificationQuestion === 'string' &&
     typeof state.planWidgetId === 'string' &&
@@ -324,6 +331,7 @@ export function isAgentLoopContinuationStateValid(
       (Array.isArray(state.toolOrder) &&
         state.toolOrder.every((name) => typeof name === 'string'))) &&
     (state.planTracking === undefined || typeof state.planTracking === 'boolean') &&
+    (state.auroraMode === undefined || isAuroraMode(state.auroraMode)) &&
     (state.loadedToolNames === undefined ||
       (Array.isArray(state.loadedToolNames) &&
         state.loadedToolNames.every((name) => typeof name === 'string'))) &&

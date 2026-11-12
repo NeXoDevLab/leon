@@ -1,6 +1,17 @@
-import type { ConnectionSetupAction, ConnectionSetupView } from '@aurora'
+import {
+  ConnectionSetupActionId as SetupAction,
+  ConnectionSetupStep as SetupStep,
+  CONNECTION_SETUP_MESSAGES,
+  getPreferredConnectionMethod,
+  type ConnectionSetupAction,
+  type ConnectionSetupView,
+  type ConnectionSetupResult
+} from '@@/aurora/src/contracts/connection-setup'
+
+export { CONNECTION_SETUP_MESSAGES, type ConnectionSetupResult } from '@@/aurora/src/contracts/connection-setup'
 
 import { CONVERSATION_SESSION_MANAGER } from '@/core/session-manager'
+import { TOOLKIT_REGISTRY } from '@/core'
 import { ensureActiveProfileRuntime } from '@/core/profile-runtime/initialize-profile-runtime'
 import {
   getActiveProfileName,
@@ -12,34 +23,6 @@ import { CONNECTION_STORE, ConnectionStatus } from './connection-store'
 import { saveConnection, startConnectionOAuth } from './connection-service'
 
 const MAXIMUM_CREDENTIAL_LENGTH = 4_096
-
-export const CONNECTION_SETUP_MESSAGES = {
-  loadError: 'Unable to load connection setup. Please try again.',
-  actionError:
-    'Unable to complete this step. Check the setup fields and account permissions, then try again.',
-  retry: 'Retry',
-  copied: 'Copied',
-  copyFailed: 'Select and copy the text above.'
-}
-
-enum SetupAction {
-  Refresh = 'refresh',
-  SelectMethod = 'select_method',
-  Manual = 'manual',
-  Credentials = 'credentials',
-  StartSetup = 'start_setup',
-  Connect = 'connect',
-  Continue = 'continue'
-}
-
-enum SetupStep {
-  Choice = 'choice',
-  Application = 'application',
-  Credentials = 'credentials',
-  Assisted = 'assisted',
-  Connected = 'connected',
-  Continued = 'continued'
-}
 
 export interface ConnectionSetupInput {
   provider: string
@@ -56,17 +39,6 @@ export interface ConnectionSetupInput {
   setup_values?: Record<string, string>
 }
 
-export interface ConnectionSetupResult {
-  view: ConnectionSetupView
-  // The host dispatches this through its normal owner-message path, preserving history.
-  event?: {
-    methodName: 'send_utterance'
-    methodParams: { from: 'owner', utterance: string }
-    session_id: string
-  }
-  authorization_url?: string
-}
-
 /**
  * Owns the connection wizard for browser clients and HTTP plugins alike.
  * Every screen is rebuilt from current profile metadata; client state carries no authority.
@@ -81,16 +53,39 @@ export async function handleConnectionSetup(
   }
 
   return runWithProfileContext({ profileName }, async () => {
-    await ensureActiveProfileRuntime()
-    if (
-      !input.session_id ||
-      !CONVERSATION_SESSION_MANAGER.getSession(input.session_id)
-    ) {
+    if (input.session_id) {
+      await ensureActiveProfileRuntime()
+    } else {
+      // Settings needs tool metadata, not model initialization.
+      await TOOLKIT_REGISTRY.load()
+    }
+    if (input.session_id && !CONVERSATION_SESSION_MANAGER.getSession(input.session_id)) {
       throw new Error('A conversation in this profile is required.')
     }
-
+    if (!input.session_id && [SetupAction.StartSetup, SetupAction.Continue].includes(input.action as SetupAction)) {
+      throw new Error('Open a conversation for assisted setup or continuing a request.')
+    }
     if (!Object.values(SetupAction).includes(input.action as SetupAction)) {
       throw new Error('Unknown connection setup action.')
+    }
+    const { prepareCatalogConnection } = await import('./catalog-setup')
+    const activation = await prepareCatalogConnection(input)
+    if (activation) {
+      return activation
+    }
+    // Activation is not authorization. After Add/Enable, show the existing
+    // account setup screen without initiating OAuth or accepting credentials.
+    if ([SetupAction.Install, SetupAction.Enable].includes(input.action as SetupAction) ||
+      input.action === SetupAction.Refresh && input.state?.method === 'catalog') {
+      input = { ...input, action: SetupAction.Refresh }
+      delete input.state
+      delete input.credentials
+      delete input.method
+    }
+    const { setupMCPConnection } = await import('@/core/tool-manager/mcp/setup')
+    const remote = await setupMCPConnection(input)
+    if (remote) {
+      return remote
     }
 
     const tool = (await getConnectionCatalog({
@@ -105,10 +100,18 @@ export async function handleConnectionSetup(
       throw new Error('This tool is no longer available.')
     }
 
-    const methodId = input.method || input.state?.method
+    let connection = (await CONNECTION_STORE.list()).find(
+      (entry) => entry.provider === input.provider
+    )
+    const connected = (): boolean =>
+      connection?.status === ConnectionStatus.Connected
+    // Keep explicit saved workflows and existing accounts intact. Only new
+    // setups use the recommendation; failures never downgrade authorization.
+    const methodId = input.method || input.state?.method ||
+      (connected() ? connection?.auth_type : undefined)
     const method = methodId
       ? tool.methods.find((entry) => entry.id === methodId)
-      : tool.methods[0]
+      : getPreferredConnectionMethod(tool.methods)
 
     if (!method) {
       throw new Error('Unknown connection method.')
@@ -117,13 +120,19 @@ export async function handleConnectionSetup(
     let step = Object.values(SetupStep).includes(input.state?.step as SetupStep)
       ? (input.state!.step as SetupStep)
       : SetupStep.Choice
-    let connection = (await CONNECTION_STORE.list()).find(
-      (entry) => entry.provider === input.provider
-    )
-    const connected = (): boolean =>
-      connection?.status === ConnectionStatus.Connected
     const needsApplication =
       method.id === 'oauth' && Object.keys(method.settings).length > 0
+    // Assisted setup can finish in another tab or an agent tool call. Refresh
+    // should then offer provider authorization, not another application setup.
+    if (
+      input.action === SetupAction.Refresh &&
+      method.id === 'oauth' &&
+      !needsApplication &&
+      [SetupStep.Application, SetupStep.Assisted].includes(step)
+    ) {
+      step = SetupStep.Choice
+    }
+
     let event: ConnectionSetupResult['event']
     let authorizationURL: string | undefined
     const ownerMessage = (
@@ -241,6 +250,7 @@ export async function handleConnectionSetup(
     ): ConnectionSetupAction => ({ id, label, secondary })
     const view: ConnectionSetupView = {
       state: { method: method.id, step },
+      tool: { name: tool.name, description: tool.description },
       title: connected() ? tool.name : `Set up ${tool.name}`,
       description: '',
       fields: [],
@@ -262,31 +272,29 @@ export async function handleConnectionSetup(
         view.actions.push(action(SetupAction.Continue, 'Continue'))
       }
     } else {
-      if (tool.methods.length > 1) {
-        view.actions.push(
-          ...tool.methods.map((entry) => ({
-            ...action(
-              SetupAction.SelectMethod,
-              entry.name,
-              entry.id !== method.id
-            ),
-            method: entry.id
-          }))
-        )
-      }
-
       if (step === SetupStep.Choice || step === SetupStep.Assisted) {
         view.description =
           step === SetupStep.Assisted
             ? 'You can follow setup progress in this conversation.'
-            : 'I’ll complete setup in your browser.'
+            : needsApplication
+              ? 'A one-time application setup is needed before you can authorize access. Enter its credentials to get started.'
+              : method.id === 'oauth'
+                ? 'Authorize access on the provider’s website. You stay in control of your permissions.'
+                : 'Enter your account token to connect securely.'
         if (step === SetupStep.Choice) {
           view.actions.push(
-            action(SetupAction.StartSetup, 'Set it up for me')
+            action(
+              method.id === 'oauth' && !needsApplication
+                ? SetupAction.Connect
+                : SetupAction.Credentials,
+              `Connect ${tool.name}`
+            )
           )
         }
 
-        view.actions.push(action(SetupAction.Manual, 'Set up manually', true))
+        if (step === SetupStep.Assisted) {
+          view.actions.push(action(SetupAction.Manual, 'Set up manually', true))
+        }
       } else {
         view.description =
           step === SetupStep.Application
@@ -340,10 +348,16 @@ export async function handleConnectionSetup(
           }
         }
 
-        view.actions.push(
-          action(SetupAction.StartSetup, 'Set it up for me', true)
-        )
+        if (needsApplication) {
+          view.actions.push(
+            action(SetupAction.StartSetup, 'Set it up for me', true)
+          )
+        }
       }
+    }
+
+    if (!input.session_id) {
+      view.actions = view.actions.filter((action) => ![SetupAction.StartSetup, SetupAction.Continue].includes(action.id as SetupAction))
     }
 
     return {

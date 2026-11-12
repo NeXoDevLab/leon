@@ -7,6 +7,7 @@ import type { SessionStatus } from '../../../apps/web/src/data/sessions'
 import { test, expect, SESSION_ID, SESSION_URL, toolContentsFixture, finishFiniteAnimations } from './fixtures'
 import { CODE_PREVIEW_LINES } from '../../../apps/web/src/components/code-view/code-highlight-types'
 import { FyiKind } from '../../../server/src/core/fyi/fyi-contract'
+import { LogoMaskMode } from '../../../aurora/src/contracts/package-logo'
 
 test('replaces fallback artwork after favicon loading and shows complete URL tooltips within the viewport', async ({ page, ui }) => {
   const url = `https://example.com/guide?note=${'slow-craft-'.repeat(24)}`
@@ -113,7 +114,12 @@ for (const legacy of [false, true]) {
     const text = '## A useful guide\n\nKeep **one good idea** close.\n\n| Topic | Note |\n| --- | --- |\n| Craft | Take your time |'
     const sources = [{ url: 'https://example.com/guide', title: 'A useful guide' }]
     const responseId = 'rich-search-response'
+    const logo = { url: 'tools/communication.gmail/assets/logo.svg', mode: LogoMaskMode.Alpha }
+    await page.route('**/api/v1/tools/communication.gmail/assets/logo.svg', (route) => route.fulfill({
+      contentType: 'image/svg+xml', path: 'tools/communication/gmail/logo.svg'
+    }))
     const tool = { id: 'rich-search', name: 'search_web.hosted.searchWeb', toolCallTitle: 'Read useful guidance',
+      toolLogo: logo,
       status: 'running' as const, input: { query: 'Useful guidance' },
       output: { output: text, format: 'markdown' }, commandOutput: text }
     const saved: ConversationRecord = {
@@ -128,7 +134,7 @@ for (const legacy of [false, true]) {
       turn_id: 'rich-search-turn', response_id: responseId, created_at: Date.now()
     }])
     await emit('turn_status', { status: 'accepted' })
-    await emit('tool_call', { tool_call: { ...tool, tool_call_title: tool.toolCallTitle, command_output: text } })
+    await emit('tool_call', { tool_call: { ...tool, tool_logo: logo, tool_call_title: tool.toolCallTitle, command_output: text } })
     const call = page.locator('.tool-call').filter({ hasText: 'Read useful guidance' })
     const revealTool = async (): Promise<void> => {
       const tools = page.getByRole('region', { name: 'Leon’s tool usage', exact: true }).last()
@@ -140,6 +146,7 @@ for (const legacy of [false, true]) {
       if (await toggle.getAttribute('aria-expanded') === 'false') {
         await toggle.click()
       }
+      await expect(call.locator('.package-icon-mask')).toHaveAttribute('data-logo-mask', LogoMaskMode.Alpha)
     }
     await revealTool()
     const preview = call.getByRole('region', { name: 'Tool output', exact: true })
@@ -431,7 +438,7 @@ for (const reducedMotion of ['no-preference', 'reduce'] as const) {
     await expect(answer.getByRole('img', { name: 'JavaScript', exact: true })).toBeVisible()
     for (const label of ['JavaScript', 'TypeScript', 'Python', 'JSON', 'HTML', 'CSS', 'Shell']) {
       const icon = answer.getByRole('img', { name: label, exact: true })
-      await icon.scrollIntoViewIfNeeded()
+      await expect(() => icon.scrollIntoViewIfNeeded()).toPass()
       await expect(icon).toHaveClass(/pierre-file-icon/)
       expect(await icon.locator('use').getAttribute('href')).toContain('#file-tree-builtin-')
       expect(await icon.evaluate((element) => element.getBoundingClientRect().width)).toBeGreaterThan(0)
@@ -519,7 +526,7 @@ for (const reducedMotion of ['no-preference', 'reduce'] as const) {
       }
       const guide = answer.getByRole('link', { name: 'a quiet guide', exact: true })
       await guide.hover()
-      await expect(guide).toHaveCSS('color', visuals.contrastColor)
+      await expect(guide).toHaveCSS('color', visuals.accent)
       await page.screenshot({ path: testInfo.outputPath(`rich-markdown-${theme}.png`) })
       await answer.locator('ul.contains-task-list').screenshot({ path: testInfo.outputPath(`task-list-${theme}.png`) })
       await answer.locator('.markdown-alert-tip').screenshot({ path: testInfo.outputPath(`alert-${theme}.png`) })
@@ -660,6 +667,56 @@ test('does not execute Markdown HTML, unsafe links, or remote images', async ({ 
   await expect(answer).toContainText('No automatic image')
   expect(await page.evaluate(() => Reflect.get(window, 'markdownExecuted'))).toBeUndefined()
   expect(outbound).toEqual([])
+})
+
+test('reserves completed diagram geometry while loading and across session revisits', async ({ page, ui }) => {
+  ui.history.get(SESSION_ID)!.at(-1)!.message = 'A few ideas, with room to explore.\n\n```mermaid\nflowchart TB\n A[An idea] --> B[Explore]\n B --> C[Make something]\n C --> D[Share]\n```\n\nA calm place to continue.'
+  const blocked = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
+  await page.route('**/markdown-mermaid-*.js', async (route) => {
+    blocked.resolve()
+    await release.promise
+    await route.continue()
+  })
+  await page.goto(SESSION_URL)
+  await blocked.promise
+  const layout = page.locator('.markdown-diagram-block > .visual-layout')
+  await expect(layout).toHaveAttribute('aria-busy', 'true')
+  expect((await layout.boundingBox())!.height).toBeGreaterThanOrEqual(240)
+  release.resolve()
+  await expect(layout).toHaveAttribute('aria-busy', 'false')
+  await expect(page.getByRole('button', { name: 'Enlarge diagram', exact: true }).locator('svg')).toBeVisible()
+  const settled = (await layout.boundingBox())!.height
+  await page.getByRole('link', { name: 'Test session 1', exact: true }).click()
+  await expect(layout).toHaveCount(0)
+  await page.evaluate(() => {
+    const heights: number[] = []
+    let frame = 0
+    function sample(): void {
+      const height = document.querySelector('.markdown-diagram-block > .visual-layout')?.getBoundingClientRect().height
+      if (height) {
+        heights.push(height)
+      }
+      frame = requestAnimationFrame(sample)
+    }
+    frame = requestAnimationFrame(sample)
+    const host = window as typeof window & { finishVisualProbe: () => number[] }
+    host.finishVisualProbe = (): number[] => {
+      cancelAnimationFrame(frame)
+
+      return heights
+    }
+  })
+  await page.getByRole('link', { name: 'Test session 0', exact: true }).click()
+  await expect(layout).toHaveAttribute('aria-busy', 'false')
+  const heights = await page.evaluate(async () => {
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+    const host = window as typeof window & { finishVisualProbe: () => number[] }
+
+    return host.finishVisualProbe()
+  })
+  expect(heights.length).toBeGreaterThan(0)
+  expect(Math.max(...heights.map((height) => Math.abs(height - settled)))).toBeLessThan(2)
 })
 
 test('renders independently loaded diagram families and safe mathematical labels', async ({ page, ui }) => {
@@ -1788,7 +1845,8 @@ for (const reducedMotion of ['no-preference', 'reduce'] as const) {
 
     await emit('turn_status', { status: 'accepted' })
     await emit('inference_activity', { activity: request })
-    await expect(inference).toBeVisible()
+    await expect(waiting).toBeVisible()
+    await expect(waiting.locator('.process-group-indicator, svg')).toHaveCount(0)
     await emit('tool_call', { tool_call: { ...tool, status: 'preparing' } })
     const execution = page.locator('.leon-message-execution').last()
     await expect(execution.getByRole('button', { name: 'Preparing tool calls...', exact: true })).toBeVisible()
@@ -1806,8 +1864,8 @@ for (const reducedMotion of ['no-preference', 'reduce'] as const) {
 
     const next = { ...request, id: 'dd', startedAt: startedAt + sequence + 1 }
     await emit('inference_activity', { activity: next })
-    await expect(inference).toBeVisible()
-    await expect(waiting).toHaveCount(0)
+    await expect(waiting).toBeVisible()
+    await expect(inference).toHaveCount(0)
     await emit('text_stream', {
       kind: 'reasoning', generationId: 'handoff-thinking', phase: 'agent', token: 'Checking the result.'
     })
@@ -2206,6 +2264,49 @@ for (const reducedMotion of ['no-preference', 'reduce'] as const) {
   }
 }
 
+test('shows remote connection and discovery as runtime activities and replays their measured durations', async ({ page, ui }) => {
+  await page.goto(SESSION_URL)
+  const startedAt = Date.now()
+  let sequence = 0
+  const responseId = 'mcp-runtime-response'
+  const emit = (type: string, data: Record<string, unknown>): Promise<void> => ui.emit([{
+    type, data, sequence: ++sequence, session_id: SESSION_ID,
+    turn_id: 'mcp-runtime-owner', response_id: responseId, created_at: startedAt + sequence
+  }])
+  const connection = { id: 'mcp-connect', kind: 'phase' as const, goal: TurnPhase.MCPConnection,
+    subject: 'Notion', startedAt, durationMs: 0, outcome: 'started' }
+  const discovery = { ...connection, id: 'mcp-discover', goal: TurnPhase.MCPDiscovery, startedAt: startedAt + 1_000 }
+  const runtime = page.getByRole('region', { name: 'Leon’s tool preparation', exact: true })
+  const processing = page.getByRole('region', { name: 'Leon’s processing', exact: true })
+  await emit('turn_status', { status: 'accepted' })
+  await emit('inference_activity', { activity: connection })
+  await expect(runtime.locator('.process-group-title')).toHaveText('Connecting to Notion...')
+  await expect(runtime.locator('[data-icon="plug"]')).toBeVisible()
+  await expect(processing).toHaveCount(0)
+  await expect(page.getByRole('region', { name: 'Leon’s inference', exact: true })).toHaveCount(0)
+  const completedConnection = { ...connection, outcome: 'completed', durationMs: 1_000 }
+  await emit('inference_activity', { activity: completedConnection })
+  await emit('inference_activity', { activity: discovery })
+  await expect(runtime.locator('.process-group-title')).toHaveText('Loading Notion tools...')
+  await expect(runtime.locator('[data-icon="stack"]')).toBeVisible()
+  const completedDiscovery = { ...discovery, outcome: 'completed', durationMs: 600 }
+  await emit('inference_activity', { activity: completedDiscovery })
+  const timings = [completedConnection, completedDiscovery]
+  const trace = { id: responseId, planSteps: [], toolCalls: [], timings }
+  ui.history.get(SESSION_ID)!.push({ who: 'leon', messageId: responseId, message: 'Your workspace is ready.',
+    sentAt: startedAt, isAddedToHistory: true, llmMetrics: { durationMs: 2_000 }, agentResponseTrace: trace })
+  await emit('final_answer', { content: 'Your workspace is ready.', response_trace: {
+    id: responseId, plan_steps: [], tool_calls: [], timings, metrics: { durationMs: 2_000 }
+  } })
+  const work = page.getByRole('region', { name: 'Leon’s completed work', exact: true }).last()
+  await page.reload()
+  await work.getByRole('button', { name: 'Worked for 2s', exact: true }).click()
+  await processing.getByRole('button', { name: /^Processed for / }).click()
+  await expect(runtime.locator('.process-group-title')).toHaveText(['Connected to Notion in 1s', 'Loaded Notion tools in 600ms'])
+  await expect(processing.getByRole('region', { name: 'Leon’s inference', exact: true })).toHaveCount(0)
+  await expect(runtime.locator('.activity-wave-active')).toHaveCount(0)
+})
+
 test('replaces one standalone processing row in place and retains completed request history', async ({ page, ui }) => {
   await page.goto(SESSION_URL)
   let sequence = 0
@@ -2215,8 +2316,15 @@ test('replaces one standalone processing row in place and retains completed requ
     turn_id: 'phase-owner', response_id: 'phase-response', created_at: startedAt + sequence
   }])
   await emit('turn_status', { status: 'accepted' })
+  await emit('inference_activity', { activity: {
+    id: 'ddd', goal: TurnPhase.Request, startedAt, durationMs: 0, outcome: 'started'
+  } })
+  const initialWorkingLabel = await page.getByRole('region', { name: 'Leon’s work', exact: true })
+    .locator('.process-group-title').innerText()
   const phases = [
-    [TurnPhase.Request, 'Processing...', 'cpu-line'],
+    [TurnPhase.Request, initialWorkingLabel, undefined],
+    [TurnPhase.Request, initialWorkingLabel, undefined],
+    ['unclassified-purpose', initialWorkingLabel, undefined],
     [TurnPhase.ToolSchemas, 'Loading tools...', 'stack-line'],
     [TurnPhase.Tools, 'Choosing tools...', 'wrench-line'],
     [TurnPhase.ToolRequest, 'Preparing tool calls...', 'wrench-line'],
@@ -2225,13 +2333,16 @@ test('replaces one standalone processing row in place and retains completed requ
     [TurnPhase.Clarification, 'Preparing a question...', 'question-mark'],
     [TurnPhase.Cancellation, 'Preparing to stop...', 'close-circle-line'],
     [TurnPhase.Connection, 'Preparing connection setup...', 'plug-line'],
+    [TurnPhase.VisualSetup, 'Preparing visual guidance...', 'layout-4-line'],
+    [TurnPhase.Visual, 'Creating a visual...', 'layout-4-line'],
+    [TurnPhase.VisualPresentation, 'Preparing visual presentation...', 'layout-4-line'],
     [TurnPhase.Answer, 'Generating an answer...', 'pencil-ai-line'],
     [TurnPhase.Inspection, 'Inspecting images...', 'eye-2-line'],
     [TurnPhase.Compaction, 'Compacting context...', 'file-reduce-line'],
     [TurnPhase.Review, 'Reviewing...', 'search-eye-line']
   ] as const
   const timings = phases.map(([goal], index) => ({
-    id: 'd'.repeat(index + 1), goal, startedAt: startedAt + index * 200,
+    id: 'd'.repeat((index + 1) * 3), goal, startedAt: startedAt + index * 200,
     durationMs: 100, outcome: 'completed'
   }))
   const request = page.getByRole('region', { name: 'Leon’s inference', exact: true })
@@ -2242,27 +2353,33 @@ test('replaces one standalone processing row in place and retains completed requ
     const activity = { ...timings[index]!, goal, durationMs: 0, outcome: 'started' }
     await emit('inference_activity', { activity })
     await expect(processing).toHaveCount(0)
-    await expect(request).toHaveCount(1)
-    await expect(request.getByRole('button')).toHaveCount(0)
-    await expect(request.locator('.process-group-title')).toHaveText(label)
-    await expect(request.locator(`[data-icon="${resolveIconName(icon)}"]`)).toBeVisible()
-    await expect(request.locator('.activity-wave')).toHaveClass(/activity-wave-active/)
-    originalRow ??= await request.elementHandle()
+    const live = icon ? request : page.getByRole('region', { name: 'Leon’s work', exact: true })
+    await expect(live).toHaveCount(1)
+    await expect(live.getByRole('button')).toHaveCount(0)
+    await expect(live.locator('.process-group-title')).toHaveText(label)
+    if (icon) {
+      await expect(live.locator(`[data-icon="${resolveIconName(icon)}"]`)).toBeVisible()
+    } else {
+      await expect(live.locator('.process-group-indicator, svg')).toHaveCount(0)
+    }
+    await expect(live.locator('.activity-wave')).toHaveClass(/activity-wave-active/)
+    originalRow ??= await live.elementHandle()
     expect(await originalRow!.evaluate((element) => element.isConnected)).toBe(true)
 
     const previous = timings[index - 1]
     if (previous) {
       // A delayed completion must not replace the newer running phase.
       await emit('inference_activity', { activity: previous })
-      await expect(request).toHaveCount(1)
-      await expect(request.locator('.process-group-title')).toHaveText(label)
+      await expect(live).toHaveCount(1)
+      await expect(live.locator('.process-group-title')).toHaveText(label)
     }
 
-    const position = await request.boundingBox()
+    const position = await live.boundingBox()
     const scrollTop = await page.locator('.app-main').evaluate((element) => element.scrollTop)
     await emit('inference_activity', { activity: timings[index]! })
     const waiting = page.getByRole('region', { name: 'Leon’s work', exact: true })
     await expect(waiting).toBeVisible()
+    await expect(waiting.locator('.process-group-title')).toHaveText(initialWorkingLabel)
     await expect(waiting.locator('.process-group-indicator, i, svg')).toHaveCount(0)
     expect(await originalRow!.evaluate((element) => element.isConnected)).toBe(true)
     expect(Math.abs((await waiting.boundingBox())!.y - position!.y)).toBeLessThan(2)
@@ -2283,7 +2400,7 @@ test('replaces one standalone processing row in place and retains completed requ
   })
   const work = page.getByRole('region', { name: 'Leon’s completed work', exact: true })
   await work.getByRole('button', { name: 'Worked for 3s', exact: true }).click()
-  await processing.getByRole('button', { name: 'Processed for 1s', exact: true }).click()
+  await processing.getByRole('button', { name: /^Processed for / }).click()
   await expect(processing.getByRole('region', { name: 'Leon’s inference', exact: true })).toHaveCount(phases.length)
   await expect(processing.getByText('Prepared tool calls in 100ms', { exact: true })).toBeVisible()
   await expect(processing.getByText('Reviewed for 100ms', { exact: true })).toBeVisible()

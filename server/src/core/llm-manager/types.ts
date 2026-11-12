@@ -227,6 +227,12 @@ export enum CompletionFailureKind {
   Provider = 'provider'
 }
 
+export enum ProviderConnectionErrorCode {
+  Unresponsive = 'PROVIDER_CONNECTION_UNRESPONSIVE',
+  Closing = 'WEBSOCKET_CONNECTION_CLOSING',
+  AbnormalClosure = 'WEBSOCKET_ABNORMAL_CLOSURE'
+}
+
 export enum ProviderRetryDecision {
   Retry = 'retry',
   Stop = 'stop'
@@ -251,6 +257,9 @@ export enum ProviderRetryReason {
  * Distinguishes transport waits, generation and retry decisions without prompt content.
  */
 export interface ProviderActivitySnapshot {
+  provider?: LLMProviders | undefined
+  connectionErrorCode?: string | undefined
+  connectionRetryAttempt?: number | undefined
   providerRequestId?: string | undefined
   transport?: 'http' | 'websocket' | 'local' | undefined
   requestId?: string | undefined
@@ -267,6 +276,12 @@ export interface ProviderActivitySnapshot {
   failureSummary?: string | undefined
   firstOutputMs?: number | undefined
   outputPreliminary?: boolean | undefined
+  reasoningOnly?: boolean | undefined
+  /**
+   * The caller permits replay and no provider-owned work or terminal completion
+   * was observed. Higher-level recovery must also check the failure kind.
+   */
+  replaySafe?: boolean | undefined
   pingCount?: number | undefined
   pongCount?: number | undefined
   lastPingAgeMs?: number | undefined
@@ -289,7 +304,6 @@ export interface CompletionAttemptTiming extends ProviderActivitySnapshot {
   transport: 'http' | 'websocket' | 'local'
   outcome: string
   failureKind?: CompletionFailureKind | undefined
-  connectionErrorCode?: string | undefined
   promptCache?: PromptCacheObservation | undefined
   inferenceTimeoutMs: number
   streamIdleTimeoutMs: number
@@ -345,6 +359,10 @@ export interface CompletionParams {
    */
   onToolCall?: (toolCall: OpenAIToolCall) => void
   shouldStream?: boolean
+  /**
+   * Selects HTTP for a single Responses request without changing other sessions.
+   */
+  responseTransport?: 'http'
   /**
    * Optional provider hint to disable thinking/reasoning for a request.
    * The core may also enable this proactively for compatibility when
@@ -412,6 +430,7 @@ export interface CompletionParams {
     attempt: number
     maxRetries: number
     delayMs: number
+    failureMessage?: string
   }) => Promise<void> | void
   /**
    * Recomputes the retry wait from the caller's remaining work budget.

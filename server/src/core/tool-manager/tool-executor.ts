@@ -307,7 +307,8 @@ export default class ToolExecutor {
               input.onProgress?.({
                 source: 'report', message: signal.aborted ? String(signal.reason) : result.message,
                 data: result.data.output,
-                stream: { id, state: result.status === 'success' && !signal.aborted ? 'completed' : 'failed' }
+                stream: { id, state: result.status === 'success' && !signal.aborted ? 'completed' : 'failed',
+                  ...(signal.aborted ? { canceled: true } : {}) }
               })
             }
 
@@ -316,7 +317,8 @@ export default class ToolExecutor {
             failure = error
             if (background || didPrepare) {
               input.onProgress?.({
-                source: 'report', message: String(error), stream: { id, state: 'failed' }
+                source: 'report', message: String(error), stream: { id, state: 'failed',
+                  ...(signal.aborted ? { canceled: true } : {}) }
               })
             }
             throw error
@@ -501,7 +503,7 @@ export default class ToolExecutor {
           CONNECTION_STORE.markNeedsAttention(provider)
         )
       )
-      requiredConnections.forEach(emitConnectionWidget)
+      requiredConnections.forEach((provider) => emitConnectionWidget(provider))
 
       return this.buildResult({
 
@@ -658,6 +660,41 @@ export default class ToolExecutor {
 
     // Tools resolve their own filesystem arguments. Other strings may be
     // literal search text, globs or source code and must remain unchanged.
+    try {
+      this.validateRequiredParameters(parsedInput, functionConfig.parameters)
+    } catch (error) {
+      return this.buildResult({ origin: input.origin, status: 'invalid_input',
+        message: (error as Error).message, input: input.toolInput ?? null, resolvedTool,
+        functionName, parsedInput, output: {} })
+    }
+    const source = TOOLKIT_REGISTRY.getToolSource(resolvedTool.toolkitId, resolvedTool.toolId)
+    if (source?.type === 'mcp') {
+      const { MCP_MANAGER } = await import('./mcp/manager')
+      const { MCPAuthenticationRequired } = await import('./mcp/auth')
+      try {
+        const result = await MCP_MANAGER.call({ toolkit_id: resolvedTool.toolkitId, tool_id: resolvedTool.toolId,
+          name: resolvedTool.toolName, description: resolvedTool.toolDescription, icon_name: resolvedTool.toolIconName,
+          source, functions: {} }, functionConfig.remote_name ?? functionName, parsedInput, {
+          ...(input.signal ? { signal: input.signal } : {}),
+          ...(input.onProgress ? { onProgress: input.onProgress } : {}),
+          ...(functionConfig.timeout ? { timeout: functionConfig.timeout } : {})
+        })
+
+        return this.buildResult({ origin: input.origin, status: result.success ? 'success' : 'error',
+          message: result.message, input: input.toolInput ?? null, resolvedTool, functionName, parsedInput,
+          output: result.output, ...(result.modelFiles ? { modelFiles: result.modelFiles } : {}) })
+      } catch (error) {
+        input.signal?.throwIfAborted()
+        const needsConnection = error instanceof MCPAuthenticationRequired
+        if (needsConnection) {
+          emitConnectionWidget(`${resolvedTool.toolkitId}.${resolvedTool.toolId}`)
+        }
+
+        return this.buildResult({ origin: input.origin, status: needsConnection ? 'not_available' : 'error',
+          message: needsConnection ? error.message : 'I could not complete this MCP request. Check the server connection and try again.',
+          input: input.toolInput ?? null, resolvedTool, functionName, parsedInput, output: {} })
+      }
+    }
     const responseJQ = this.getResponseJQ(functionConfig)
     let argsArray: unknown[] = []
     try {
@@ -705,7 +742,7 @@ export default class ToolExecutor {
           CONNECTION_STORE.markNeedsAttention(provider)
         )
       )
-      declaredConnections.forEach(emitConnectionWidget)
+      declaredConnections.forEach((provider) => emitConnectionWidget(provider))
 
       return this.buildResult({
 
@@ -782,7 +819,7 @@ export default class ToolExecutor {
             CONNECTION_STORE.markNeedsAttention(provider)
           )
         )
-        declaredConnections.forEach(emitConnectionWidget)
+        declaredConnections.forEach((provider) => emitConnectionWidget(provider))
         runtimeResult.output['required_connections'] = declaredConnections
       }
     }

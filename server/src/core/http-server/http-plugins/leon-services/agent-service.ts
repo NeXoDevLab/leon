@@ -1,4 +1,5 @@
 import { collectArtifacts } from '@/core/artifacts/artifact-context'
+import { finishAuroraAnswer } from '@/core/aurora/answer-presentation'
 import type { Artifact } from '@/core/artifacts/artifact-types'
 import { performance } from 'node:perf_hooks'
 import { randomUUID } from 'node:crypto'
@@ -9,11 +10,13 @@ import { prepareAgentTurn } from '@/core/turn-lifecycle/pre-turn'
 import { runTurnLifecycle } from '@/core/turn-lifecycle'
 import { runWithTurnTiming, runTurnPhase, TurnPhase, setTurnTimingSession, getTurnTimings } from '@/core/llm-manager/turn-timing'
 import { measureOtherProcessingDuration } from '@/core/llm-manager/llm-duties/react-llm-duty/agent-metrics'
+import { isToolPreparationPhase } from '@/core/llm-manager/turn-timing-contract'
 import { prepareOwnerAttachments } from '@/core/owner-attachments'
 import { getActiveProfileName, runWithProfileContext } from '@/core/profile-runtime/profile-context'
 import { ensureActiveProfileRuntime } from '@/core/profile-runtime/initialize-profile-runtime'
 import { isValidProfileName } from '@/core/profile-runtime/profile-paths'
 import { CONVERSATION_SESSION_MANAGER } from '@/core/session-manager'
+import { CONVERSATION_REPOSITORY } from '@/core/session-manager/conversation-repository'
 import type { LeonClientInterfaceTokenPayload } from '@/core/leon-interface/types'
 
 import type {
@@ -113,13 +116,14 @@ export async function runAgent(
       HTTPPluginAgentTrace['plan_transitions']
     > = []
     const toolCalls = new Map<string, HTTPPluginToolCall>()
+    let responseAccepted = false
     const progressMessages = new Map<
       string,
       NonNullable<HTTPPluginAgentTrace['progress_messages']>[number]
     >()
     const toolStartedAt = new Map<string, number>()
     let actionExecutionMs = 0
-    let reasoningSummary = 'Understanding your request'
+    let reasoningSummary = 'Working'
     const requestId = input.request_id || null
     const messageId = `${turnId}:leon`
     let turnArtifacts: Artifact[] = []
@@ -236,7 +240,11 @@ export async function runAgent(
               }
             }
             toolCalls.set(event.toolCall.id, toolCall)
-            emit('tool_call', { tool_call: toolCall })
+            if (responseAccepted && event.toolCall.preparation) {
+              CONVERSATION_REPOSITORY.updateToolPreparation(sessionId, messageId!, event.toolCall)
+            }
+            emit('tool_call', { tool_call: toolCall,
+              ...(responseAccepted && event.toolCall.preparation ? { background: true } : {}) })
           }
         })
 
@@ -257,7 +265,7 @@ export async function runAgent(
         const durationMs = elapsedMilliseconds(totalStartedAt)
         const otherDuration = startedAt === undefined ? undefined : measureOtherProcessingDuration(
           startedAt, durationMs,
-          timings.filter((timing) => timing.kind === 'inference' || timing.goal === TurnPhase.Tool)
+          timings.filter((timing) => timing.kind === 'inference' || timing.goal === TurnPhase.Tool || isToolPreparationPhase(timing.goal))
         )
         const metrics = {
           ...(llmMetrics || {}),
@@ -299,12 +307,17 @@ export async function runAgent(
         finalTrace = trace
 
         if (typeof output === 'string' && output.trim()) {
+          const answerParts = finishAuroraAnswer(
+            sessionId, messageId, output,
+            data['finalIntent'] === 'answer' || data['finalIntent'] === 'clarification', turnArtifacts
+          )
           await runTurnPhase(TurnPhase.Persistence, () => CONVERSATION_LOGGER.upsert(
             {
               who: 'leon',
               message: output,
               isAddedToHistory: true,
               artifacts: turnArtifacts,
+              ...(answerParts.length ? { answerParts } : {}),
               ...(messageId ? { messageId } : {}),
               agentResponseTrace: {
                 ...((data['agentResponseTrace'] as AgentResponseTrace | undefined) || deserializeAgentTrace(trace)),
@@ -314,12 +327,20 @@ export async function runAgent(
             },
             { sessionId }
           ))
+          responseAccepted = true
+          for (const call of toolCalls.values()) {
+            if (call.preparation) {
+              const saved = deserializeAgentTrace({ plan_steps: [], tool_calls: [call] }).toolCalls[0]!
+              CONVERSATION_REPOSITORY.updateToolPreparation(sessionId, messageId!, saved)
+            }
+          }
           emit('metrics', { metrics })
           emit('final_answer', {
             message_id: messageId || '',
             content: output,
             response_trace: trace,
-            artifacts: turnArtifacts
+            artifacts: turnArtifacts,
+            answer_parts: answerParts
           })
         }
 

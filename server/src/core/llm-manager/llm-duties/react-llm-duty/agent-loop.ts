@@ -3,6 +3,7 @@ import { ToolExecutionState } from '@/core/tool-manager/tool-execution-manager'
 import { ConversationHistoryHelper } from '@/helpers/conversation-history-helper'
 import { TOOLKIT_REGISTRY } from '@/core'
 import { EXPERIENCE_SEARCH_TOOL_NAME } from '@/core/experience-manager'
+import { CATALOG_SEARCH_TOOL_NAME, createCatalogSearchTool } from '@/core/tool-manager/catalog/agent-catalog'
 import type { ExperienceCard } from '@/core/experience-manager'
 import {
   CONNECTION_SETUP_TOOL_NAME,
@@ -13,6 +14,7 @@ import {
 import { LogHelper } from '@/helpers/log-helper'
 import {
   CompletionFailureKind,
+  ProviderRetryReason,
   type AgentToolTranscriptMessage,
   type ProviderReasoningItem,
   type ProviderMessageMetadata,
@@ -22,6 +24,16 @@ import {
   type OpenAIToolCall
 } from '@/core/llm-manager/types'
 import type { MessageLog } from '@/types'
+import {
+  AGENT_CLARIFICATION_TOOL_NAME, AURORA_PRESENT_NAME, AuroraMode
+} from '@/core/aurora/agent-ui-contract'
+import {
+  createClarificationTool, createAuroraLoaderTool, enableAuroraTools,
+  executeAuroraToolCall, resolveAuroraClarification,
+  type AgentUICatalog, type PresentAgentUI
+} from '@/core/aurora/agent-ui-tools'
+
+export { AGENT_CLARIFICATION_TOOL_NAME } from '@/core/aurora/agent-ui-contract'
 
 import type {
   AgentSkillContext,
@@ -53,9 +65,9 @@ import {
 } from './agent-image-batches'
 import { parseToolCallArguments, validateToolInput } from './agent-utils'
 import { AgentRunDeadlineError, type AgentRunBudget } from './agent-run-budget'
+import { describeProviderConnectionFailure } from '@/core/llm-manager/llm-provider/provider-request-activity'
 
 export const AGENT_PLAN_TOOL_NAME = 'update_plan'
-export const AGENT_CLARIFICATION_TOOL_NAME = 'request_clarification'
 export const AGENT_CANCELLATION_TOOL_NAME = 'cancel_task'
 export const AGENT_SKILL_TOOL_NAME = 'load_agent_skill'
 export const AGENT_TOOLKIT_LOADER_NAME = 'load_toolkit'
@@ -83,7 +95,7 @@ export function buildAgentConnectionGuidance(
 
   return needsSetup
     ? `<connection_setup>
-- A connection_required tool observation means the connection setup card has already been displayed. Explain the needed step briefly in the owner's language, using the supplied tool-owned setup facts; do not repeat the entire wizard.
+- A connection_required tool observation means the connection setup card has already been displayed. Explain the needed step briefly in the owner's language, using the supplied tool-owned setup facts; do not repeat the entire wizard. Never collect tokens, passwords or client secrets through ordinary chat, Aurora Form or Generated UI; use the trusted connection card.
 - Answer setup questions using those facts. Offer to complete setup through the owner's browser or let them use the card manually. Keep the original task pending unless the owner cancels or changes it. For manual setup, use request_clarification to pause and ask the owner to select Continue after connecting.
 - When the owner asks you to handle setup, use browser tools and submit the declared credentials through setup_connection, not shell commands or settings files. The application name supplied in the owner's setup request takes precedence over tool defaults. OAuth application setup still requires provider authorization through the connection card.
 - Never quote secrets in chat, plans, or summaries, retrieve unrelated credentials from files or browser storage, or bypass the connection layer. Refer to the exact callback URL displayed in the card; do not invent it.
@@ -151,6 +163,7 @@ export const AGENT_SYSTEM_PROMPT = `You are an autonomous agent with tools.
 
 <tool_policy>
 - Use only the provided tools.
+- When current service availability or account status is unknown, use ${CATALOG_SEARCH_TOOL_NAME} if available before claiming support or access. Distinguish not added, disabled, needs connection and ready; offer the trusted setup card, never install or enable catalog entries yourself.
 - For every executable toolkit call, set ${AGENT_TOOL_CALL_TITLE_ARGUMENT_NAME} to a very short, action-specific title that explains the immediate goal and includes the key target when useful.
 - Select the small set of functions needed for the expected workflow, including output and verification, together in the first load for each relevant toolkit. Batch independent toolkit and skill loads. Expand discovery when new evidence requires another capability; do not load unrelated functions. Prefer a dedicated toolkit over a general operating-system toolkit when both could perform the task.
 - Prefer dedicated/API tools, then direct browser inspection and browser actions for web interfaces, then semantic OS tools. Use screenshots for visual questions, unsupported controls or a concrete inspection limitation. Use bounded shell commands for non-visual work without a dedicated tool, and computer use for graphical interaction. Observe before acting. Accept low-risk tool success unless the effect is unverified, failure is reported, or consequences require verification; follow the toolkit's verification rules.
@@ -193,6 +206,8 @@ export const AGENT_SYSTEM_PROMPT = `You are an autonomous agent with tools.
 - During extended work, accompany tool calls with brief owner-facing progress at meaningful milestones, changed approaches after obstacles, or otherwise prolonged waits. State verified findings and the next action. Do not narrate every click, expose private reasoning, claim unverified progress, or stop to announce future work. Progress is intermediate only alongside tool calls.
 - Keep the final answer concise and proportionate to the request; avoid recapping execution details unless asked.
 - Use Markdown naturally when it improves readability: short paragraphs, emphasis, lists, descriptive links, and fenced code with a language. Use headings and tables only when useful; do not over-format brief answers or emit raw HTML.
+- Proactively use charts for numerical trends/comparisons, diagrams for relationships, and custom visuals when interaction or layout improves understanding. Keep simple numbers, prose and small static tables in Markdown. Load the needed UI mode without asking display permission; do not create dashboards or extra questions merely to use UI.
+- Required yes/no decisions, explicit choices and related missing fields use load_ui mode input, then request_clarification.input. Open-ended questions stay plain text. Use native mode for standard visual widgets or generated for bespoke visuals; their controls never directly execute tools.
 - When citing sources, use descriptive inline links rather than a separate sources list unless the owner requests one.
 - Refer to yourself in the first person.
 - Wrap every file path as [FILE_PATH]/path[/FILE_PATH].
@@ -287,8 +302,7 @@ export interface AgentCallableFunction {
   functionConfig: FunctionConfig
 }
 
-export interface AgentToolCatalog {
-  tools: OpenAITool[]
+export interface AgentToolCatalog extends AgentUICatalog {
   functionsByToolName: Map<string, AgentCallableFunction>
   availableToolkitsById: Map<string, AgentToolkitSummary>
   loadedToolkitIds: Set<string>
@@ -378,6 +392,7 @@ interface AgentModelCallOptions {
   completionReviewIntent?: 'answer' | 'clarification'
   requiresPlanReconciliation?: boolean
   isContextRecoveryAttempt?: boolean
+  isStallRecoveryAttempt?: boolean
   isImageInspection?: boolean
   hasPendingImages?: boolean
   elapsedMs?: number
@@ -387,6 +402,7 @@ interface AgentModelCallOptions {
 type AgentFunctionExecutionResult = ToolExecutionResult
 
 export interface AgentLoopParams {
+  onPresentUI?: PresentAgentUI
   signal?: AbortSignal
   runBudget?: AgentRunBudget
   transcript: AgentToolTranscriptMessage[]
@@ -413,7 +429,7 @@ export interface AgentLoopParams {
    * Settles previews with the result of a call handled without tool dispatch.
    */
   onToolCallSkipped?: (toolCallId: string, reason: string) => void
-  onInspectionCheckpoint?: (
+  onCheckpoint?: (
     state: Pick<AgentLoopResult, 'transcript' | 'executionHistory' | 'trackedSteps'>
   ) => Promise<void> | void
   drainOwnerMessages?: () => Promise<AgentToolTranscriptMessage[]>
@@ -450,7 +466,7 @@ export function buildAgentToolCatalog(
   progressiveToolkitLoading = true,
   initiallyLoadedFunctionNames?: Iterable<string>,
   initiallyLoadedToolNames?: Iterable<string>,
-  previous?: { toolOrder: string[], planTracking: boolean }
+  previous?: { toolOrder: string[], planTracking: boolean, auroraMode?: AuroraMode }
 ): AgentToolCatalog {
   const tools: OpenAITool[] = []
   const functionsByToolName = new Map<string, AgentCallableFunction>()
@@ -482,7 +498,10 @@ export function buildAgentToolCatalog(
       forcedTool.toolkitId,
       forcedTool.toolId
     )
-    tools.push(createClarificationTool(), createCancellationTool())
+    tools.push(createAuroraLoaderTool(), createClarificationTool(), createCancellationTool())
+    if (previous?.auroraMode) {
+      enableAuroraTools(catalog, previous.auroraMode)
+    }
     return catalog
   }
 
@@ -513,6 +532,8 @@ export function buildAgentToolCatalog(
     tools.unshift(createToolkitLoaderTool(availableToolkitsById))
   }
   tools.push(
+    createCatalogSearchTool(),
+    createAuroraLoaderTool(),
     createAgentPlanTool(AGENT_PLAN_TOOL_NAME),
     createClarificationTool(),
     createCancellationTool(),
@@ -520,6 +541,13 @@ export function buildAgentToolCatalog(
   )
 
   if (previous) {
+    // Older saved visual workflows have no capability marker and used the
+    // complete catalog. Restore those compatibly without enlarging fresh turns.
+    const mode = previous.auroraMode ??
+      (previous.toolOrder.includes(AURORA_PRESENT_NAME) ? AuroraMode.Generated : undefined)
+    if (mode) {
+      enableAuroraTools(catalog, mode)
+    }
     const order = new Map(previous.toolOrder.map((name, index) => [name, index]))
 
     // Rebuild callable contracts from the current registry while retaining their
@@ -943,6 +971,7 @@ export async function runAgentLoop(
   const mainIterations = iterationLimit - finishingIterations
   let hasUsedOutputRecovery = false
   let hasUsedContextRecovery = false
+  let hasUsedStallRecovery = false
   let hasOwnerUpdates = false
   const lastQueuedSource = transcript.findLastIndex((message) =>
     message.role !== 'assistant' && message.files?.some((file) => file.inspectionPending)
@@ -991,6 +1020,7 @@ export async function runAgentLoop(
     let isImageInspection = false
     let isRecoveryAttempt = false
     let isOutputRecoveryAttempt = false
+    let isStallRecoveryAttempt = false
     // Once a provider needs the smaller context target, keep that target for
     // the rest of the run instead of allowing the prompt to grow back.
     let isContextRecoveryAttempt = hasUsedContextRecovery
@@ -1032,6 +1062,7 @@ export async function runAgentLoop(
             ...(imageBatch ? { isImageInspection, hasPendingImages: true } : {}),
             ...(remindPlan ? { requiresPlanReconciliation: true } : {}),
             ...(isOutputRecoveryAttempt ? { isOutputRecoveryAttempt: true } : {}),
+            ...(isStallRecoveryAttempt ? { isStallRecoveryAttempt: true } : {}),
             ...(isContextRecoveryAttempt
               ? { isContextRecoveryAttempt: true }
               : {})
@@ -1052,6 +1083,24 @@ export async function runAgentLoop(
         }
 
         if (error instanceof AgentModelResponseTimeoutError) {
+          if (!hasUsedStallRecovery && !params.runBudget?.isFinishing &&
+            error.diagnostics?.reasoningOnly === true &&
+            error.diagnostics.replaySafe === true &&
+            !error.diagnostics.providerCompleted &&
+            error.diagnostics.retryReason === ProviderRetryReason.Exhausted) {
+            // Replaying the same stalled request has already failed. Rebuild
+            // from retained evidence once without replaying completed actions.
+            hasUsedStallRecovery = true
+            hasUsedContextRecovery = true
+            isRecoveryAttempt = true
+            isStallRecoveryAttempt = true
+            isContextRecoveryAttempt = true
+            await params.onProgressMessage?.(
+              'I am recovering from the model stall using compacted evidence and a fresh request.'
+            )
+            continue
+          }
+
           // An operational stall may consume the work budget. Use the existing
           // reserve once to deliver from evidence without renewing the deadline.
           if (params.runBudget?.isFinishing && !hasEnteredFinishing) {
@@ -1066,7 +1115,7 @@ export async function runAgentLoop(
         if (
           error instanceof AgentModelProviderError &&
           error.canRetryWithCompaction &&
-          !hasUsedContextRecovery
+          !hasUsedContextRecovery && !isStallRecoveryAttempt
         ) {
           // Context pressure gets one smaller retry inside the same loop turn.
           hasUsedContextRecovery = true
@@ -1112,7 +1161,7 @@ export async function runAgentLoop(
         Boolean(modelResult.textContent?.trim()) ||
         Boolean(modelResult.toolCalls?.length)
       const shouldRecover = modelResult.isTruncated || !hasUsableOutput
-      if (!shouldRecover || hasUsedOutputRecovery || params.runBudget?.isFinishing) {
+      if (!shouldRecover || hasUsedOutputRecovery || isStallRecoveryAttempt || params.runBudget?.isFinishing) {
         break
       }
 
@@ -1141,7 +1190,7 @@ export async function runAgentLoop(
         )
       }
 
-      await params.onInspectionCheckpoint?.({ transcript, executionHistory, trackedSteps })
+      await params.onCheckpoint?.({ transcript, executionHistory, trackedSteps })
       await params.onProgressMessage?.(
         `Saved findings for this image batch. Images inspected: ${imageBatch.entries.length}; remaining: ${imageBatch.remainingImages}.`
       )
@@ -1190,7 +1239,7 @@ export async function runAgentLoop(
         }
 
         const canSkipReview = iteration === 1 && !hasOwnerUpdates &&
-          !hasUsedOutputRecovery && !hasUsedContextRecovery && !hasEnteredFinishing &&
+          !hasUsedOutputRecovery && !hasUsedContextRecovery && !hasUsedStallRecovery && !hasEnteredFinishing &&
           params.initialExecutionHistory === undefined &&
           params.initialTrackedSteps === undefined && trackedSteps.length === 0 &&
           isCompleteOptionalLookup(params.catalog, executionHistory)
@@ -1385,6 +1434,11 @@ export async function runAgentLoop(
       operationalTurnsSincePlanUpdate += 1
     }
 
+    if (terminalSignal?.intent !== 'cancelled') {
+      // Persist only settled exchanges, before another inference can fail.
+      await params.onCheckpoint?.({ transcript, executionHistory, trackedSteps })
+    }
+
     if (params.runBudget?.isExpired && terminalSignal?.intent !== 'cancelled') {
       return createResumableAgentResult('deadline', transcript, executionHistory, trackedSteps)
     }
@@ -1430,6 +1484,15 @@ export async function runAgentLoop(
             executionHistory,
             trackedSteps
           }
+        }
+      }
+
+      if (terminalSignal.ui && params.onPresentUI) {
+        try {
+          await params.onPresentUI(terminalSignal.ui, 'clarification')
+        } catch (error) {
+          transcript.push({ role: 'user', content: `The visual question could not be displayed: ${String(error)}. Correct its references or ask the question without UI.` })
+          continue
         }
       }
 
@@ -1975,7 +2038,8 @@ function createResumableAgentResult(
   const answer = buildResumableAgentAnswer(
     failureKind,
     trackedSteps,
-    answerDrafted
+    answerDrafted,
+    diagnostics
   )
   if (diagnostics?.failureSummary) {
     transcript.push({
@@ -1999,14 +2063,15 @@ function createResumableAgentResult(
 function buildResumableAgentAnswer(
   failureKind: CompletionFailureKind | 'synthesis' | 'deadline' | 'review',
   trackedSteps: TrackedPlanStep[],
-  answerDrafted = false
+  answerDrafted = false,
+  diagnostics?: ProviderActivitySnapshot
 ): string {
   const explanations: Record<typeof failureKind, string> = {
-    [CompletionFailureKind.Connection]: 'The connection to my model provider was interrupted before I could finish.',
+    [CompletionFailureKind.Connection]: describeProviderConnectionFailure(diagnostics),
     deadline: 'The task reached its run deadline.',
     review: 'The completion check failed.',
     [CompletionFailureKind.Timeout]: 'The model response exceeded its time limit.',
-    [CompletionFailureKind.Context]: 'The model could not process the task context.',
+    [CompletionFailureKind.Context]: 'My task context could not fit within the working limit.',
     [CompletionFailureKind.Unavailable]: 'The model provider is temporarily unavailable or rate limited.',
     [CompletionFailureKind.Provider]: 'The model provider failed to return a usable response.',
     synthesis: 'The model did not finish the final response.'
@@ -2155,6 +2220,10 @@ async function executeAgentToolCall(
   trackedSteps: TrackedPlanStep[]
   signal?: FinalResponseSignal
 }> {
+  const visual = await executeAuroraToolCall(toolCall, params.catalog, params.onPresentUI)
+  if (visual) {
+    return { ...visual, trackedSteps }
+  }
   if (toolCall.function.name === AGENT_CANCELLATION_TOOL_NAME) {
     const signal = getCancellationSignal(toolCall)
     if (!signal) {
@@ -2172,6 +2241,18 @@ async function executeAgentToolCall(
 
     return {
       content: await setupConnection(input),
+      trackedSteps
+    }
+  }
+
+  if (
+    toolCall.function.name === CATALOG_SEARCH_TOOL_NAME &&
+    params.catalog.tools.some((tool) => tool.function.name === CATALOG_SEARCH_TOOL_NAME)
+  ) {
+    const { searchAgentCatalog } = await import('@/core/tool-manager/catalog/agent-catalog')
+
+    return {
+      content: await searchAgentCatalog(parseToolCallArguments(toolCall.function.arguments) || {}),
       trackedSteps
     }
   }
@@ -2206,6 +2287,20 @@ async function executeAgentToolCall(
       }
     }
     const selectedTools = toolkit.tools.filter((tool) => !toolId || tool.id === toolId)
+    try {
+      await TOOLKIT_REGISTRY.prepareToolkit?.(toolkitId, typeof toolId === 'string' ? toolId : undefined)
+    } catch (error) {
+      const { MCPAuthenticationRequired } = await import('@/core/tool-manager/mcp/auth')
+      if (error instanceof MCPAuthenticationRequired) {
+        const { emitConnectionWidget } = await import('@/core/connections/connection-widget')
+        for (const tool of selectedTools) {
+          if (TOOLKIT_REGISTRY.getToolSource(toolkitId, tool.id)) {
+            emitConnectionWidget(`${toolkitId}.${tool.id}`)
+          }
+        }
+      }
+      return { content: 'I could not load this MCP server’s functions. Check its connection in Settings → Tools and connections, then retry.', trackedSteps }
+    }
     const availableFunctions = new Set(selectedTools.flatMap((tool) =>
       Object.keys(TOOLKIT_REGISTRY.getToolFunctions(toolkitId, tool.id) || {})
         .map((name) => `${tool.id}.${name}`)
@@ -2274,10 +2369,17 @@ async function executeAgentToolCall(
       }
     }
 
+    const visual = resolveAuroraClarification(
+      parseToolCallArguments(toolCall.function.arguments), params.catalog, Boolean(params.onPresentUI)
+    )
+    if (visual.error) {
+      return { content: visual.error, trackedSteps }
+    }
+
     return {
       content: 'Clarification requested. Wait for the owner response.',
       trackedSteps,
-      signal
+      signal: { ...signal, ...(visual.ui ? { ui: visual.ui } : {}) }
     }
   }
 
@@ -2593,39 +2695,6 @@ function createCancellationTool(): OpenAITool {
           }
         },
         required: ['acknowledgment'],
-        additionalProperties: false
-      }
-    }
-  }
-}
-
-function createClarificationTool(): OpenAITool {
-  return {
-    type: 'function',
-    function: {
-      name: AGENT_CLARIFICATION_TOOL_NAME,
-      description:
-        'Pause the current agent run and ask the owner one concrete question about required information, authorization, or owner action that available tools cannot resolve. Call this alone, after inspecting available tool results; never alongside other calls or for draft text. The owner reply resumes the same work with its current plan, evidence, and artifacts.',
-      parameters: {
-        type: 'object',
-        properties: {
-          question: {
-            type: 'string',
-            description: 'One concise question that unblocks the current task.'
-          },
-          explanation: {
-            type: 'string',
-            description:
-              'Optional concise explanation of what remains incomplete and why.'
-          },
-          alternatives: {
-            type: 'array',
-            items: { type: 'string' },
-            description:
-              'Optional practical alternatives available to the owner.'
-          }
-        },
-        required: ['question'],
         additionalProperties: false
       }
     }

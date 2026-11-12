@@ -455,7 +455,9 @@ function findCompletedToolExchanges(
  * Requiring another tail's worth of work avoids re-summarizing every turn.
  */
 export function splitAgentTranscriptForSummary(
-  transcript: AgentToolTranscriptMessage[]
+  transcript: AgentToolTranscriptMessage[],
+  forceCompaction = false,
+  recentExchangeLimit = SUMMARY_RECENT_EXCHANGES
 ): {
   older: AgentToolTranscriptMessage[]
   visual: AgentToolTranscriptMessage[]
@@ -472,14 +474,27 @@ export function splitAgentTranscriptForSummary(
         : []
     )
   ])].sort((left, right) => left - right)
-  if (boundaries.length < SUMMARY_RECENT_EXCHANGES * 2) {
+  // Recovery can reduce even short histories while preserving complete exchanges.
+  const recentExchanges = forceCompaction
+    ? Math.min(recentExchangeLimit, Math.floor(boundaries.length / 2))
+    : SUMMARY_RECENT_EXCHANGES
+  if (boundaries.length === 0 || boundaries.length < recentExchanges * 2) {
     return null
   }
 
   // The continuation retains the latest owner message separately. Anchoring the
   // tail to that message would retain all subsequent work in a long task.
-  const boundary = boundaries[boundaries.length - SUMMARY_RECENT_EXCHANGES]!
-  if (boundary <= 0) return null
+  // The last completed exchange may exceed the budget on its own. Its saved
+  // result can replace it, but unfinished calls must remain in the raw tail.
+  const boundary = recentExchanges > 0
+    ? boundaries[boundaries.length - recentExchanges]!
+    : Math.max(
+        exchanges.at(-1)?.endIndex ?? -1,
+        boundaries.at(-1)!
+      ) + 1
+  if (boundary <= 0) {
+    return null
+  }
 
   // Keep a bounded visual reference even when the recent tail is text-only.
   // Retain whole exchanges so parallel tool results never become orphaned.

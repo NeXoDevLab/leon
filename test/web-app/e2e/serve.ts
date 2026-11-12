@@ -81,7 +81,7 @@ try {
           if (initial.has(chunk.fileName) && chunk.moduleIds.some((id) =>
             id.endsWith('/search-sessions-dialog/search-sessions-dialog.tsx') ||
             id.endsWith('/weather-layer/weather-layer.tsx') ||
-            id.endsWith('/icon/rare-icon-morphs.ts') || id.endsWith('/icon/rare-brand-icons.ts'))) {
+            id.endsWith('/icon/rare-icon-morphs.ts'))) {
             this.error(`Optional interaction code must stay outside startup: ${chunk.fileName}`)
           }
           if (chunk.moduleIds.some((id) => id.includes('/test/web-app/previews/'))) {
@@ -90,7 +90,9 @@ try {
           if (initial.has(chunk.fileName) && chunk.moduleIds.some((id) =>
             id.includes('/@pierre/') || id.includes('/@shikijs/') || id.includes('/shiki/') ||
             id.includes('/pele/') || id.includes('/dompurify/') || id.includes('/katex/') ||
-            id.includes('/streamdown/') || id.includes('/marked/') || id.includes('/unified/'))) {
+            id.includes('/streamdown/') || id.includes('/marked/') || id.includes('/unified/') ||
+            id.includes('/@json-render/') || id.includes('virtual:aurora-') ||
+            id.includes('/components/aurora-answer/generated/'))) {
             this.error(`Rendering engines must stay outside the startup graph: ${chunk.fileName}`)
           }
         }

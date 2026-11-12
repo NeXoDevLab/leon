@@ -5,6 +5,7 @@ import path from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { saveConnection } from '@/core/connections/connection-service'
 import { ConnectionStatus } from '@/core/connections/connection-store'
+import { AuroraMode } from '@/core/aurora/agent-ui-contract'
 import { ToolExecutionState } from '@/core/tool-manager/tool-execution-manager'
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -68,6 +69,8 @@ import {
   AGENT_TOOL_CALL_DIAGNOSIS_DELAY_MS,
   AGENT_TOOL_CALL_TITLE_ARGUMENT_NAME,
   AGENT_REMOTE_PROVIDER_HISTORY_LOGS,
+  AGENT_REMOTE_CONTEXT_RECOVERY_TRIGGER_TOKENS,
+  CHARS_PER_TOKEN,
   AGENT_MODEL_RESPONSE_TIMEOUT_MS,
   AGENT_MODEL_RESPONSE_MAX_DURATION_MS
 } from '@/core/llm-manager/llm-duties/react-llm-duty/agent-constants'
@@ -75,13 +78,19 @@ import {
   LLMDuties,
   LLMProviders,
   CompletionFailureKind,
+  ProviderConnectionErrorCode,
+  ProviderRetryReason,
   InferencePurpose,
   type AgentToolTranscriptMessage,
   type ProviderReasoningItem,
   type OpenAIToolCall,
+  type OpenAITool,
   type CompletionParams
 } from '@/core/llm-manager/types'
 import { ModelResponseState, type ModelResponseStatus } from '@/core/leon-interface/types'
+import { AURORA_CHOICE_SPEC, AURORA_FORM_SPEC, AURORA_GENERATED_SPEC, AURORA_PRESENTATION_SPEC, AURORA_RETIRED_RESULTS_SPEC } from '../../fixtures/aurora'
+import { isAuroraSpec } from '../../../aurora/src/v2/contracts/answer'
+import { validateGeneratedSurfaces } from '@/core/aurora/generated-validation'
 
 const coreMocks = vi.hoisted(() => ({
   getFlattenedTools: vi.fn(),
@@ -146,7 +155,8 @@ vi.mock('@/core', () => ({
     getFlattenedTools: coreMocks.getFlattenedTools,
     getToolFunctions: coreMocks.getToolFunctions,
     getToolConcurrency: (): ToolConcurrency => ToolConcurrency.Parallel,
-    resolveToolById: coreMocks.resolveToolById
+    resolveToolById: coreMocks.resolveToolById,
+    getToolIconLogo: (): undefined => undefined
   }
 }))
 
@@ -263,6 +273,7 @@ it.each(['success', 'error', 'background', 'throw'])(
 
 it('announces binary readiness only after actual preparation starts', async () => {
   const onPreparationProgress = vi.fn(async (): Promise<void> => {})
+  const preparationUpdates = vi.fn()
   const readyReport = {
     key: 'bridges.tools.binary_ready',
     message: 'Binary ready.',
@@ -277,7 +288,7 @@ it('announces binary readiness only after actual preparation starts', async () =
       {},
       undefined,
       undefined,
-      undefined,
+      preparationUpdates,
       undefined,
       onPreparationProgress
     )
@@ -292,6 +303,7 @@ it('announces binary readiness only after actual preparation starts', async () =
   await run()
 
   expect(onPreparationProgress).not.toHaveBeenCalled()
+  expect(preparationUpdates.mock.calls.some(([event]) => event.preparation)).toBe(false)
   expect(coreMocks.emitAnswerToChatClients).not.toHaveBeenCalledWith(
     expect.objectContaining({ toolPhase: 'preparation' })
   )
@@ -309,6 +321,10 @@ it('announces binary readiness only after actual preparation starts', async () =
   })
 
   await run()
+
+  expect(preparationUpdates).toHaveBeenLastCalledWith(expect.objectContaining({
+    preparation: expect.objectContaining({ status: 'ready' })
+  }))
 
   expect(onPreparationProgress.mock.calls).toEqual([
     ['Downloading missing binary.'],
@@ -345,14 +361,47 @@ it('announces binary readiness only after actual preparation starts', async () =
   expect(retained.executionHandle).toEqual(stream)
   expect(JSON.parse(retained.execution.observation).execution.progress.data.percentage).toBe(40)
   expect(onPreparationProgress).not.toHaveBeenCalledWith('react.tool.ready')
-  expect(onProgress).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'running' }))
+  expect(onProgress).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'running', preparation: {
+    status: 'downloading', detail: 'Downloading fixture: 40%.', executionId: stream.id, completed: 40, total: 100
+  } }))
   coreMocks.executeTool.mock.lastCall![0].onProgress({
     source: 'report', message: 'Done.', data: { result: 'Prepared' },
     stream: { ...stream, state: 'completed' }
   })
   expect(onPreparationProgress).toHaveBeenLastCalledWith('react.tool.ready')
-  expect(onProgress).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'success' }))
+  expect(onProgress).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'success',
+    preparation: expect.objectContaining({ status: 'ready', executionId: stream.id }) }))
 })
+
+it.each(['failure', 'cancellation', 'execution failure'])(
+  'retains truthful preparation state through %s', async (outcome) => {
+    const updates = vi.fn()
+    coreMocks.executeTool.mockImplementationOnce(async (input) => {
+      input.onProgress({ source: 'report', phase: 'preparation', message: 'Preparing files.',
+        data: { percentage: -1 }, stream: { id: 'preparation', state: 'running' } })
+      expect(updates).toHaveBeenLastCalledWith(expect.objectContaining({ preparation: {
+        status: 'preparing', detail: 'Preparing files.', executionId: 'preparation'
+      } }))
+      if (outcome === 'execution failure') {
+        input.onProgress({ source: 'report', phase: 'execution', message: 'Files ready.', preparationComplete: true })
+      } else {
+        input.onProgress({ source: 'report', phase: 'execution', message: 'Preparation scope exited.' })
+        expect(updates).toHaveBeenLastCalledWith(expect.objectContaining({
+          preparation: expect.objectContaining({ status: 'preparing' })
+        }))
+      }
+      input.onProgress({ source: 'report', message: 'Stopped.', stream: {
+        id: 'preparation', state: 'failed', ...(outcome === 'cancellation' ? { canceled: true } : {})
+      } })
+
+      return { status: 'error', message: 'Stopped.', data: { output: {} } }
+    })
+    await runToolExecution('test', 'lookup', 'run', '{}', {}, undefined, undefined, updates)
+    expect(updates).toHaveBeenLastCalledWith(expect.objectContaining({ preparation: expect.objectContaining({
+      status: outcome === 'execution failure' ? 'ready' : outcome === 'cancellation' ? 'cancelled' : 'failed'
+    }) }))
+  }
+)
 
 it('submits connection secrets without retaining them in the loop transcript', async () => {
   const secret = 'fixture-connection-secret'
@@ -490,6 +539,331 @@ function runAgentLoop(params: AgentLoopParams): ReturnType<typeof runAgentLoopWi
 }
 
 describe('continuous agent loop', () => {
+  it('accepts bounded native presentations with safe destinations and complete, aligned data', () => {
+    expect(isAuroraSpec(AURORA_PRESENTATION_SPEC)).toBe(true)
+    expect(validateGeneratedSurfaces(AURORA_PRESENTATION_SPEC)).toEqual([])
+    expect(isAuroraSpec(AURORA_RETIRED_RESULTS_SPEC)).toBe(true)
+    expect(validateGeneratedSurfaces(AURORA_RETIRED_RESULTS_SPEC).join('\n')).toContain('retired Results widget')
+    const result = AURORA_RETIRED_RESULTS_SPEC.elements['results']!
+    const table = AURORA_PRESENTATION_SPEC.elements['data-table']!
+    const chart = AURORA_PRESENTATION_SPEC.elements['chart']!
+    const comparison = AURORA_PRESENTATION_SPEC.elements['comparison']!
+    if (result.type !== 'Results' || table.type !== 'DataTable' || chart.type !== 'Chart' || comparison.type !== 'Comparison') {
+      throw new Error('The presentation fixture must cover every native data widget.')
+    }
+
+    const invalid = [
+      { ...result, props: { ...result.props, items: [{ id: 'link', title: 'Unsafe', url: 'javascript:alert(1)' }] } },
+      { ...result, props: { ...result.props, items: [result.props.items[0], result.props.items[0]] } },
+      { ...table, props: { ...table.props, rows: [{ id: 'row', values: { day: 'Monday' } }] } },
+      { ...table, props: { ...table.props, rows: [{ id: 'row', values: { day: 'Monday', minutes: 20, extra: true } }] } },
+      { ...table, props: { ...table.props, rows: Array.from({ length: 129 }, (_, id) => ({ id: String(id), values: { day: 'Monday', minutes: 20 } })) } },
+      { ...comparison, props: { ...comparison.props, options: comparison.props.options.map((option) => ({ ...option, values: {} })) } },
+      { ...chart, props: { ...chart.props, series: [{ label: 'Reading', values: [20] }] } },
+      { ...chart, props: { ...chart.props, kind: 'pie', series: [{ label: 'Reading', values: [20, -35, 25, 45] }] } }
+    ]
+    for (const node of invalid) {
+      expect(isAuroraSpec({ root: 'view', elements: { view: node } })).toBe(false)
+    }
+  })
+
+  it.each([
+    { css: '.panel{color:#abcdef}', html: '<div class="panel"></div>', issue: 'color tokens' },
+    { css: '.panel{background:rebeccapurple}', html: '<div class="panel"></div>', issue: 'color tokens' },
+    { css: '.panel{border:1px solid rgb(20,30,40)}', html: '<div class="panel"></div>', issue: 'color tokens' },
+    { css: '.panel{color:var(--color-primary)}', html: '<div class="panel"></div>', issue: 'Unknown Aurora token' },
+    { css: '.panel{border-radius:var(--radius-lg)}', html: '<div class="panel"></div>', issue: 'Unknown Aurora token' },
+    { css: ':root{--color-accent:var(--color-success)}', html: '<div></div>', issue: 'Do not redefine' },
+    { css: '.panel{color:var(--color-text)!important}', html: '<div class="panel"></div>', issue: 'Remove !important' },
+    { css: '.action{padding:var(--space-sm)}', html: '<button class="action">Continue</button>', issue: 'Do not restyle control' },
+    { css: '', html: '<button style="border-radius:12px">Continue</button>', issue: 'Do not restyle control' },
+    { css: '', html: '<svg><circle fill="red"/></svg>', issue: 'color tokens' },
+    { css: '.panel{font-family:monospace}', html: '<div class="panel"></div>', issue: 'font/line-height token' }
+  ])('returns repairable design diagnostics instead of accepting an invented skin: $css $html', ({ css, html, issue }) => {
+    const spec = structuredClone(AURORA_GENERATED_SPEC)
+    const node = spec.elements['reading']!
+    if (node.type === 'Generated') {
+      node.props.css = css
+      node.props.html = html
+    }
+    expect(validateGeneratedSurfaces(spec).join('\n')).toContain(issue)
+  })
+
+  it('accepts custom geometry, semantic paints, native controls and responsive token-based typography', () => {
+    const spec = structuredClone(AURORA_GENERATED_SPEC)
+    const node = spec.elements['reading']!
+    if (node.type === 'Generated') {
+      node.props.html = '<div class="panel"><button data-variant="primary">Continue</button><svg><defs><mask id="coverage"><rect fill="white" style="stroke:black"/></mask></defs><circle fill="var(--color-accent)"/></svg></div>'
+      node.props.css = '.panel{--progress:45%;width:min(100%,720px);color:var(--color-text);font-size:var(--font-size-md);border-radius:var(--border-radius-lg);background:linear-gradient(90deg,var(--color-accent-soft),transparent)}button{margin-top:var(--space-sm)}'
+    }
+    expect(validateGeneratedSurfaces(spec)).toEqual([])
+  })
+  it('returns generated source diagnostics without executing code and publishes only repaired source', async () => {
+    coreMocks.getFlattenedTools.mockReturnValue([])
+    const onPresentUI = vi.fn().mockResolvedValue('surface-one')
+    const invalid = structuredClone(AURORA_GENERATED_SPEC)
+    const node = invalid.elements['reading']!
+    if (node.type === 'Generated') {
+      node.props.javascript = 'const broken = ;'
+    }
+    const callModel = vi.fn()
+      .mockResolvedValueOnce({ toolCalls: [toolCall('load', 'load_ui', {})] })
+      .mockResolvedValueOnce({ toolCalls: [toolCall('check', 'preview_ui', { spec: invalid })] })
+      .mockImplementationOnce(async (messages: AgentToolTranscriptMessage[]) => {
+        expect(JSON.parse(messages.at(-1)!.content)).toMatchObject({ valid: false, browserRendered: false })
+        expect(onPresentUI).not.toHaveBeenCalled()
+        return { toolCalls: [toolCall('publish-broken', 'present_ui', { spec: invalid })] }
+      })
+      .mockImplementationOnce(async (messages: AgentToolTranscriptMessage[]) => {
+        expect(messages.at(-1)!.content).toContain('Visual answer rejected')
+        expect(onPresentUI).not.toHaveBeenCalled()
+        return { toolCalls: [toolCall('check-fixed', 'preview_ui', { spec: AURORA_GENERATED_SPEC })] }
+      })
+      .mockImplementationOnce(async (messages: AgentToolTranscriptMessage[]) => {
+        expect(JSON.parse(messages.at(-1)!.content)).toMatchObject({ valid: true, browserRendered: false })
+        return { toolCalls: [toolCall('publish', 'present_ui', { preview_id: JSON.parse(messages.at(-1)!.content).preview_id })] }
+      })
+      .mockResolvedValueOnce({ textContent: 'Here is your reading time, with room to explore a goal.' })
+    const result = await runAgentLoop({ transcript: [], catalog: buildAgentToolCatalog(), callModel,
+      onPresentUI, executeFunction: vi.fn(), loadAgentSkill: async () => null })
+    expect(result.intent).toBe('answer')
+    expect(onPresentUI).toHaveBeenCalledExactlyOnceWith(AURORA_GENERATED_SPEC, 'answer', undefined)
+    const restored = buildAgentToolCatalog(undefined, [], true, [], [], {
+      toolOrder: ['load_ui', 'preview_ui', 'present_ui', AGENT_CLARIFICATION_TOOL_NAME], planTracking: false
+    })
+    expect(restored.tools.map((tool) => tool.function.name)).toEqual(expect.arrayContaining(['present_ui', 'preview_ui']))
+  })
+  it('upgrades visual capabilities when custom source is useful without downgrading an active workflow', async () => {
+    coreMocks.getFlattenedTools.mockReturnValue([])
+    const onPresentUI = vi.fn().mockResolvedValue('surface-one')
+    let generatedContracts: string
+    const callModel = vi.fn()
+      .mockResolvedValueOnce({ toolCalls: [toolCall('native', 'load_ui', { mode: AuroraMode.Native })] })
+      .mockImplementationOnce(async (messages, tools) => {
+        expect(messages.at(-1).content).not.toContain('Runtime globals: Aurora')
+        expect(JSON.stringify(tools)).not.toContain('"Generated"')
+        return { toolCalls: [toolCall('bespoke', 'present_ui', { spec: AURORA_GENERATED_SPEC })] }
+      })
+      .mockImplementationOnce(async (messages) => {
+        expect(messages.at(-1).content).toContain('mode generated')
+        expect(onPresentUI).not.toHaveBeenCalled()
+        return { toolCalls: [toolCall('generated', 'load_ui', { mode: AuroraMode.Generated })] }
+      })
+      .mockImplementationOnce(async (messages, tools) => {
+        expect(messages.at(-1).content).toContain('Runtime globals: Aurora')
+        expect(messages.at(-1).content).not.toContain('Do not repeat the spec')
+        generatedContracts = JSON.stringify(tools)
+        return { toolCalls: [toolCall('inputs', 'load_ui', { mode: AuroraMode.Input })] }
+      })
+      .mockImplementationOnce(async (messages, tools) => {
+        expect(JSON.stringify(tools)).toBe(generatedContracts)
+        expect(messages.at(-1).content).toContain('already loaded')
+        expect(messages.at(-1).content).not.toContain('Runtime globals: Aurora')
+        return { toolCalls: [toolCall('check', 'preview_ui', { spec: AURORA_GENERATED_SPEC })] }
+      })
+      .mockImplementationOnce(async (messages) => ({ toolCalls: [toolCall('publish', 'present_ui', {
+        preview_id: JSON.parse(messages.at(-1).content).preview_id
+      })] }))
+      .mockResolvedValueOnce({ textContent: 'You can explore the goal in the chart.' })
+    const result = await runAgentLoop({ transcript: [], catalog: buildAgentToolCatalog(), callModel,
+      onPresentUI, executeFunction: vi.fn(), loadAgentSkill: async () => null })
+    expect(result.intent).toBe('answer')
+    expect(onPresentUI).toHaveBeenCalledExactlyOnceWith(AURORA_GENERATED_SPEC, 'answer', undefined)
+  })
+
+  it('loads native UI on demand and publishes an approved clarification only after review', async () => {
+    coreMocks.getFlattenedTools.mockReturnValue([])
+    const catalog = buildAgentToolCatalog()
+    const onPresentUI = vi.fn().mockResolvedValue('surface-one')
+    let reviewed = false
+    let calls = 0
+    const result = await runAgentLoopWithCompletionReview({
+      transcript: [{ role: 'user', content: 'Ask me to choose how to start.' }],
+      catalog, onPresentUI, executeFunction: vi.fn(), loadAgentSkill: async () => null,
+      callModel: async (messages, tools, options) => {
+        if (options.isCompletionReview) {
+          expect(onPresentUI).not.toHaveBeenCalled()
+          reviewed = true
+          return { textContent: JSON.stringify({ status: 'complete', reason: 'The owner must choose.' }) }
+        }
+        calls += 1
+        if (calls === 1) {
+          expect(tools.some((tool) => tool.function.name === 'present_ui')).toBe(false)
+          return { toolCalls: [toolCall('load', 'load_ui', { mode: AuroraMode.Native })] }
+        }
+        expect(tools.some((tool) => tool.function.name === 'present_ui')).toBe(true)
+        expect(JSON.stringify(tools)).not.toContain('"Generated"')
+        const presentation = tools.find((tool) => tool.function.name === 'present_ui')!
+        expect(presentation.function.parameters.properties).not.toHaveProperty('spec')
+        expect(presentation.function.parameters.required).toContain('preview_id')
+        const clarification = tools.find((tool) => tool.function.name === AGENT_CLARIFICATION_TOOL_NAME)!
+        expect(clarification.function.parameters.properties).not.toHaveProperty('ui')
+        expect(clarification.function.parameters.properties).toHaveProperty('preview_id')
+        if (calls === 2) {
+          return { toolCalls: [toolCall('stale-question', AGENT_CLARIFICATION_TOOL_NAME, {
+            question: 'How would you like to start?', preview_id: 'expired-preview'
+          })] }
+        }
+        if (calls === 3) {
+          expect(messages.at(-1)!.content).toContain('preview is unavailable')
+          expect(onPresentUI).not.toHaveBeenCalled()
+          return { toolCalls: [toolCall('check-question', 'preview_ui', { spec: AURORA_CHOICE_SPEC })] }
+        }
+        return { toolCalls: [toolCall('ask', AGENT_CLARIFICATION_TOOL_NAME, {
+          question: 'How would you like to start?', preview_id: JSON.parse(messages.at(-1)!.content).preview_id
+        })] }
+      }
+    })
+    expect(reviewed).toBe(true)
+    expect(result.intent).toBe('clarification')
+    expect(onPresentUI).toHaveBeenCalledExactlyOnceWith(AURORA_CHOICE_SPEC, 'clarification')
+  })
+
+  it('restores visual capabilities and guidance without restoring turn-local previews', async () => {
+    coreMocks.getFlattenedTools.mockReturnValue([])
+    const catalog = buildAgentToolCatalog(undefined, [], true, [], [], {
+      toolOrder: ['load_ui', 'preview_ui', 'present_ui', AGENT_CLARIFICATION_TOOL_NAME],
+      planTracking: false, auroraMode: AuroraMode.Generated
+    })
+    const onPresentUI = vi.fn().mockResolvedValue('surface-one')
+    const callModel = vi.fn()
+      .mockResolvedValueOnce({ toolCalls: [toolCall('load', 'load_ui', { mode: AuroraMode.Generated })] })
+      .mockImplementationOnce(async (messages: AgentToolTranscriptMessage[]) => {
+        expect(messages.at(-1)!.content).toContain('Runtime globals: Aurora')
+        return { toolCalls: [toolCall('stale', 'present_ui', { preview_id: 'expired-preview' })] }
+      })
+      .mockImplementationOnce(async (messages: AgentToolTranscriptMessage[]) => {
+        expect(messages.at(-1)!.content).toContain('preview is unavailable')
+        expect(onPresentUI).not.toHaveBeenCalled()
+        return { toolCalls: [toolCall('check', 'preview_ui', { spec: AURORA_GENERATED_SPEC })] }
+      })
+      .mockImplementationOnce(async (messages: AgentToolTranscriptMessage[]) => ({
+        toolCalls: [toolCall('publish', 'present_ui', { preview_id: JSON.parse(messages.at(-1)!.content).preview_id })]
+      }))
+      .mockResolvedValueOnce({ textContent: 'Your chart is ready to explore.' })
+    const result = await runAgentLoop({ transcript: [], catalog, callModel,
+      onPresentUI, executeFunction: vi.fn(), loadAgentSkill: async () => null })
+
+    expect(result.intent).toBe('answer')
+    expect(onPresentUI).toHaveBeenCalledExactlyOnceWith(AURORA_GENERATED_SPEC, 'answer', undefined)
+  })
+
+  it('reports actionable native schema errors so a required form can be repaired before clarification', async () => {
+    coreMocks.getFlattenedTools.mockReturnValue([])
+    const onPresentUI = vi.fn().mockResolvedValue('surface-one')
+    const callModel = vi.fn()
+      .mockResolvedValueOnce({ toolCalls: [toolCall('load', 'load_ui', {})] })
+      .mockResolvedValueOnce({ toolCalls: [toolCall('ask', AGENT_CLARIFICATION_TOOL_NAME, {
+        question: 'What are the project details?',
+        ui: { root: 'form', elements: { form: { type: 'Form', props: {
+          fields: [{ name: 'name', label: 'Project name', type: 'text' }], submitLabel: 'Save'
+        } } } }
+      })] })
+      .mockImplementationOnce(async (messages: AgentToolTranscriptMessage[]) => {
+        expect(messages.at(-1)?.content).toContain('/elements/form/props/title: Required property')
+        expect(messages.at(-1)?.content).toContain('/elements/form/props/submitLabel: Unexpected property')
+        expect(onPresentUI).not.toHaveBeenCalled()
+        return { toolCalls: [toolCall('repair', AGENT_CLARIFICATION_TOOL_NAME, {
+          question: 'What are the project details?', ui: AURORA_FORM_SPEC
+        })] }
+      })
+    const result = await runAgentLoop({ transcript: [], catalog: buildAgentToolCatalog(), callModel,
+      onPresentUI, executeFunction: vi.fn(), loadAgentSkill: async () => null })
+    expect(result.intent).toBe('clarification')
+    expect(onPresentUI).toHaveBeenCalledExactlyOnceWith(AURORA_FORM_SPEC, 'clarification')
+  })
+
+  it.each([
+    { type: 'BooleanChoice', props: { title: 'Keep this idea?' } },
+    AURORA_CHOICE_SPEC.elements['choice']!,
+    { type: 'Choice', props: { title: 'Which ideas?', multiple: true, options: [
+      { value: 'garden', label: 'A garden' }, { value: 'drawing', label: 'A drawing' }
+    ] } },
+    AURORA_FORM_SPEC.elements['project']!
+  ])('loads only input contracts for a required $type clarification', async (input) => {
+    coreMocks.getFlattenedTools.mockReturnValue([])
+    const onPresentUI = vi.fn().mockResolvedValue('surface-one')
+    const catalog = buildAgentToolCatalog()
+    const callModel = vi.fn()
+      .mockImplementationOnce(async (_messages, tools) => {
+        const clarification = tools.find((tool: OpenAITool) => tool.function.name === AGENT_CLARIFICATION_TOOL_NAME)!
+        expect(clarification.function.parameters.properties).not.toHaveProperty('input')
+        return { toolCalls: [toolCall('load', 'load_ui', { mode: AuroraMode.Input })] }
+      })
+      .mockImplementationOnce(async (messages, tools) => {
+        expect(messages.at(-1).content).not.toContain('Runtime globals: Aurora')
+        expect(tools.some((tool: OpenAITool) => tool.function.name === 'present_ui')).toBe(false)
+        return { toolCalls: [toolCall('ask', AGENT_CLARIFICATION_TOOL_NAME, {
+          question: 'What would you like?', input
+        })] }
+      })
+    const result = await runAgentLoop({ transcript: [], catalog, callModel,
+      onPresentUI, executeFunction: vi.fn(), loadAgentSkill: async () => null })
+    expect(callModel).toHaveBeenCalledTimes(2)
+    expect(result.intent).toBe('clarification')
+    expect(onPresentUI).toHaveBeenCalledExactlyOnceWith({ root: 'input', elements: { input } }, 'clarification')
+    const restored = buildAgentToolCatalog(undefined, [], true, [], [], {
+      toolOrder: catalog.tools.map((tool) => tool.function.name), planTracking: false, auroraMode: catalog.auroraMode!
+    })
+    const resumedModel = vi.fn().mockImplementation(async (_messages, tools) => {
+      const clarification = tools.find((tool: OpenAITool) => tool.function.name === AGENT_CLARIFICATION_TOOL_NAME)!
+      expect(clarification.function.parameters.properties).toHaveProperty('input')
+      expect(clarification.function.parameters.properties).not.toHaveProperty('ui')
+      expect(clarification.function.parameters.properties).not.toHaveProperty('preview_id')
+      return { textContent: 'Thank you, I have what I need.' }
+    })
+    await runAgentLoop({ transcript: result.transcript, catalog: restored, callModel: resumedModel,
+      onPresentUI, executeFunction: vi.fn(), loadAgentSkill: async () => null })
+    expect(resumedModel).toHaveBeenCalledOnce()
+  })
+
+  it('rejects invalid or competing clarification input instead of silently dropping its widget', async () => {
+    coreMocks.getFlattenedTools.mockReturnValue([])
+    const onPresentUI = vi.fn()
+    const callModel = vi.fn()
+      .mockResolvedValueOnce({ toolCalls: [toolCall('load', 'load_ui', { mode: AuroraMode.Input })] })
+      .mockResolvedValueOnce({ toolCalls: [toolCall('invalid', AGENT_CLARIFICATION_TOOL_NAME, {
+        question: 'Choose a pace.', input: { type: 'Choice', props: { title: 'Pace', options: [] } }
+      })] })
+      .mockImplementationOnce(async (messages: AgentToolTranscriptMessage[]) => {
+        expect(messages.at(-1)?.content).toContain('Clarification input rejected')
+        return { toolCalls: [toolCall('competing', AGENT_CLARIFICATION_TOOL_NAME, {
+          question: 'Choose a pace.', input: AURORA_CHOICE_SPEC.elements['choice'], ui: AURORA_CHOICE_SPEC
+        })] }
+      })
+      .mockImplementationOnce(async (messages: AgentToolTranscriptMessage[]) => {
+        expect(messages.at(-1)?.content).toContain('provide input or one composed visual, not both')
+        return { toolCalls: [toolCall('open', AGENT_CLARIFICATION_TOOL_NAME, { question: 'What do you have in mind?' })] }
+      })
+    const result = await runAgentLoop({ transcript: [], catalog: buildAgentToolCatalog(), callModel,
+      onPresentUI, executeFunction: vi.fn(), loadAgentSkill: async () => null })
+    expect(result.intent).toBe('clarification')
+    expect(onPresentUI).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    { root: 'script', elements: { script: { type: 'script', props: { src: 'https://example.com/script.js' } } } },
+    { root: 'text', elements: { text: { type: 'Text', props: { text: { $expr: 'window.location' } } } } },
+    { root: 'text', elements: { text: { type: 'Text', props: { text: 'A note' }, events: { press: { action: 'execute' } } } } },
+    { root: 'layout', elements: { layout: { type: 'Stack', props: {}, children: ['layout'] } } }
+  ])('returns invalid UI as a repairable observation without rendering executable content: $root', async (spec) => {
+    coreMocks.getFlattenedTools.mockReturnValue([])
+    const onPresentUI = vi.fn()
+    const callModel = vi.fn()
+      .mockResolvedValueOnce({ toolCalls: [toolCall('load', 'load_ui', {})] })
+      .mockResolvedValueOnce({ toolCalls: [toolCall('unsafe', 'present_ui', {
+        spec
+      })] })
+      .mockImplementationOnce(async (messages: AgentToolTranscriptMessage[]) => {
+        expect(messages.at(-1)?.content).toContain('Visual answer rejected')
+        return { textContent: 'Here is an ordinary text answer.' }
+      })
+    const result = await runAgentLoop({ transcript: [], catalog: buildAgentToolCatalog(), callModel,
+      onPresentUI, executeFunction: vi.fn(), loadAgentSkill: async () => null })
+    expect(onPresentUI).not.toHaveBeenCalled()
+    expect(result.intent).toBe('answer')
+  })
+
   it('retains provider failure facts for the owner and the resumed agent', async () => {
     const diagnostics = {
       providerEventCount: 2, providerCompleted: false, elapsedMs: 20_000,
@@ -512,7 +886,133 @@ describe('continuous agent loop', () => {
     })
   })
 
-  it('reports an interrupted connection with saved work and its pending step', async () => {
+  it.each([true, false])('bounds stall recovery while preserving completed actions (recovers: %s)', async (recovers) => {
+    const timeout = new AgentModelResponseTimeoutError({
+      providerEventCount: 3, providerCompleted: false, elapsedMs: 90_000,
+      reasoningOnly: true, replaySafe: true, retryReason: ProviderRetryReason.Exhausted
+    })
+    const executeFunction = vi.fn().mockResolvedValue({
+      execution: { function: callable.qualifiedName, status: 'success', observation: 'Receipt saved: release-42.' }
+    })
+    const checkpoints: unknown[] = []
+    const onCheckpoint = vi.fn((state) => {
+      checkpoints.push(structuredClone(state))
+    })
+    const callModel = vi.fn()
+      .mockResolvedValueOnce({ toolCalls: [toolCall('save-receipt', CALLABLE_TOOL_NAME, { query: 'release' })] })
+      .mockRejectedValueOnce(timeout)
+      .mockImplementationOnce(async (messages, _tools, options) => {
+        expect(options).toMatchObject({ isRecoveryAttempt: true, isStallRecoveryAttempt: true })
+        expect(messages.some((message: AgentToolTranscriptMessage) => message.content.includes('release-42'))).toBe(true)
+        expect(onCheckpoint).toHaveBeenCalledOnce()
+        if (!recovers) {
+          throw timeout
+        }
+
+        return { textContent: 'Receipt saved: release-42.' }
+      })
+      .mockResolvedValueOnce({ textContent: JSON.stringify({ status: 'complete', reason: 'The receipt is verified.' }) })
+
+    const result = await runAgentLoopWithCompletionReview({
+      transcript: [{ role: 'user', content: 'Save the release receipt.' }], catalog: createCatalog(),
+      callModel, executeFunction, onCheckpoint, loadAgentSkill: async () => null
+    })
+
+    expect(result.intent).toBe(recovers ? 'answer' : 'error')
+    expect(callModel).toHaveBeenCalledTimes(recovers ? 4 : 3)
+    expect(executeFunction).toHaveBeenCalledOnce()
+    expect(result.executionHistory).toHaveLength(1)
+    expect(result.executionHistory[0]?.observation).toContain('release-42')
+    expect(checkpoints[0]).toMatchObject({
+      transcript: expect.arrayContaining([expect.objectContaining({ role: 'tool', content: 'Receipt saved: release-42.' })])
+    })
+  })
+
+  it.each([
+    { reasoningOnly: false, replaySafe: true, providerCompleted: false },
+    { reasoningOnly: true, replaySafe: false, providerCompleted: false },
+    { reasoningOnly: true, replaySafe: true, providerCompleted: true }
+  ])('does not replay a stall without safe unfinished reasoning: %j', async (evidence) => {
+    const callModel = vi.fn().mockRejectedValue(new AgentModelResponseTimeoutError({
+      providerEventCount: 3, elapsedMs: 90_000, retryReason: ProviderRetryReason.Exhausted,
+      ...evidence
+    }))
+    const result = await runAgentLoopWithCompletionReview({
+      transcript: [], catalog: createCatalog(), callModel,
+      executeFunction: vi.fn(), loadAgentSkill: async () => null
+    })
+
+    expect(result.intent).toBe('error')
+    expect(callModel).toHaveBeenCalledOnce()
+  })
+
+  it.each(['cancellation', 'deadline'])('honors %s before dispatching stall recovery', async (stop) => {
+    const clock = vi.spyOn(performance, 'now').mockReturnValue(0)
+    const budget = new AgentRunBudget(Date.now() + 120_000)
+    const owner = new AbortController()
+    const cancellation = new Error('Stopped by the owner.')
+    const callModel = vi.fn().mockRejectedValue(new AgentModelResponseTimeoutError({
+      providerEventCount: 3, providerCompleted: false, elapsedMs: 90_000,
+      reasoningOnly: true, replaySafe: true, retryReason: ProviderRetryReason.Exhausted
+    }))
+
+    try {
+      const pending = runAgentLoopWithCompletionReview({
+        transcript: [], catalog: createCatalog(), callModel, runBudget: budget, signal: owner.signal,
+        executeFunction: vi.fn(), loadAgentSkill: async () => null,
+        onProgressMessage: () => {
+          if (stop === 'cancellation') {
+            owner.abort(cancellation)
+          } else {
+            clock.mockReturnValue(120_000)
+          }
+        }
+      })
+
+      if (stop === 'cancellation') {
+        await expect(pending).rejects.toBe(cancellation)
+      } else {
+        expect(await pending).toMatchObject({
+          intent: 'error', answer: expect.stringContaining('progress is saved')
+        })
+        expect(budget.isExpired).toBe(true)
+      }
+      expect(callModel).toHaveBeenCalledOnce()
+    } finally {
+      budget.dispose()
+      clock.mockRestore()
+    }
+  })
+
+  it.each([
+    { diagnostics: {}, explanation: 'The connection to my model provider was interrupted before I could finish.' },
+    {
+      diagnostics: { provider: LLMProviders.OpenAI, connectionErrorCode: ProviderConnectionErrorCode.Unresponsive },
+      explanation: 'My connection to OpenAI stopped responding.'
+    },
+    {
+      diagnostics: { provider: LLMProviders.OpenAI, connectionErrorCode: ProviderConnectionErrorCode.Closing },
+      explanation: 'My connection to OpenAI was interrupted.'
+    },
+    {
+      diagnostics: { provider: LLMProviders.OpenAI, connectionErrorCode: 'ECONNREFUSED' },
+      explanation: 'I could not reach OpenAI.'
+    },
+    {
+      diagnostics: {
+        provider: LLMProviders.OpenAI, connectionErrorCode: ProviderConnectionErrorCode.Unresponsive,
+        retryReason: ProviderRetryReason.Exhausted, connectionRetryAttempt: 5
+      },
+      explanation: 'I could not reconnect to OpenAI after several attempts.'
+    },
+    {
+      diagnostics: {
+        provider: LLMProviders.OpenAI, connectionErrorCode: ProviderConnectionErrorCode.Unresponsive,
+        retryReason: ProviderRetryReason.Exhausted, connectionRetryAttempt: 0
+      },
+      explanation: 'My connection to OpenAI stopped responding.'
+    }
+  ])('explains connection failures alongside saved work: $explanation', async ({ diagnostics, explanation }) => {
     const trackedSteps = [
       { label: 'Inspect originals', status: 'completed' as const },
       { label: 'Review the saved edit', status: 'in_progress' as const }
@@ -521,12 +1021,14 @@ describe('continuous agent loop', () => {
       transcript: [{ role: 'user', content: 'Continue.' }], catalog: createCatalog(),
       initialTrackedSteps: trackedSteps,
       callModel: async () => {
-        throw new AgentModelProviderError('Connection failed', false, CompletionFailureKind.Connection)
+        throw new AgentModelProviderError('Connection failed', false, CompletionFailureKind.Connection, {
+          ...diagnostics, providerEventCount: 0, providerCompleted: false, elapsedMs: 10_000
+        })
       },
       executeFunction: vi.fn(), loadAgentSkill: async () => null
     })
 
-    expect(result.answer).toContain('The connection to my model provider was interrupted before I could finish.')
+    expect(result.answer).toContain(explanation)
     expect(result.answer).toContain('progress is saved')
     expect(result.answer).toContain('Inspect originals')
     expect(result.answer).toContain('Review the saved edit')
@@ -564,7 +1066,7 @@ describe('continuous agent loop', () => {
     const result = await runAgentLoop({
       transcript, catalog: createCatalog(), executeFunction,
       loadAgentSkill: async () => null,
-      onInspectionCheckpoint: (state) => {
+      onCheckpoint: (state) => {
         checkpoints.push(state.transcript.flatMap((message) =>
           message.role === 'assistant' ? [] : message.files ?? []).length)
       },
@@ -1864,9 +2366,17 @@ describe('continuous agent loop', () => {
   })
 
   it('keeps direct answers without tools on the fast path', async () => {
-    const callModel = vi.fn().mockResolvedValue({ textContent: 'Pong.' })
+    coreMocks.getFlattenedTools.mockReturnValue([])
+    const callModel = vi.fn().mockImplementation(async (_messages, tools) => {
+      const clarification = tools.find((tool: OpenAITool) => tool.function.name === AGENT_CLARIFICATION_TOOL_NAME)!
+      expect(clarification.function.parameters.properties).not.toHaveProperty('input')
+      expect(clarification.function.parameters.properties).not.toHaveProperty('ui')
+      expect(tools.some((tool: OpenAITool) => tool.function.name === 'load_ui')).toBe(true)
+      expect(JSON.stringify(tools)).not.toContain('"Generated"')
+      return { textContent: 'Pong.' }
+    })
     const result = await runAgentLoopWithCompletionReview({
-      transcript: [{ role: 'user', content: 'Ping.' }], catalog: createCatalog(),
+      transcript: [{ role: 'user', content: 'Ping.' }], catalog: buildAgentToolCatalog(),
       callModel, executeFunction: vi.fn(), loadAgentSkill: async () => null
     })
     expect(result.answer).toBe('Pong.')
@@ -4243,7 +4753,7 @@ describe('continuous agent loop', () => {
     )
   })
 
-  it('persists a resumable transcript with a bounded lifetime', () => {
+  it('persists the task evidence and catalog needed for resumption', () => {
     const state = createAgentLoopContinuationState({
       originalInput: 'Send the message.',
       clarificationQuestion: 'Which recipient?',
@@ -4259,6 +4769,7 @@ describe('continuous agent loop', () => {
       loadedToolkitIds: ['communication'],
       loadedFunctionNames: ['communication.mail.send'],
       loadedToolNames: ['communication.mail'],
+      auroraMode: AuroraMode.Input,
       transcript: [
         { role: 'assistant', content: 'Recipient lookup complete.' }
       ],
@@ -4271,6 +4782,8 @@ describe('continuous agent loop', () => {
     expect(state.loadedToolkitIds).toEqual(['communication'])
     expect(state.loadedFunctionNames).toEqual(['communication.mail.send'])
     expect(state.loadedToolNames).toEqual(['communication.mail'])
+    expect(state.auroraMode).toBe(AuroraMode.Input)
+    expect(isAgentLoopContinuationStateValid({ ...state, auroraMode: 'unknown' })).toBe(false)
     expect(isAgentLoopContinuationStateValid({ ...state, loadedFunctionNames: undefined })).toBe(true)
     expect(state.transcript).toHaveLength(1)
     expect(state.transcript[0]?.content).toContain(
@@ -4318,7 +4831,8 @@ describe('conversation protocol history', () => {
     loadedToolNames: ['test.lookup'],
     loadedFunctionNames: ['test.lookup.run'],
     toolOrder: [CALLABLE_TOOL_NAME],
-    planTracking: true
+    planTracking: true,
+    auroraMode: AuroraMode.Input
   }
 
   beforeEach(() => {
@@ -4404,6 +4918,7 @@ describe('conversation protocol history', () => {
     expect(restored?.toolOrder).toEqual(snapshot.toolOrder)
     expect(restored?.loadedFunctionNames).toEqual(snapshot.loadedFunctionNames)
     expect(restored?.planTracking).toBe(true)
+    expect(restored?.auroraMode).toBe(AuroraMode.Input)
     expect(restored).not.toHaveProperty('trackedSteps')
     expect(restored).not.toHaveProperty('executionHistory')
     expect(new AgentSessionState().getConversationStore()).toBeNull()
@@ -4433,6 +4948,95 @@ describe('agent automatic compaction', () => {
 
   afterEach(() => {
     coreMocks.prompt.mockReset()
+  })
+
+  it.each([
+    {
+      exchanges: 13, resultCharacters: 30_000,
+      lastResultCharacters: 30_000, summaryAvailable: false
+    },
+    {
+      exchanges: 8, resultCharacters: 100_000,
+      lastResultCharacters: 100_000, summaryAvailable: false
+    },
+    {
+      exchanges: 13, resultCharacters: 30_000,
+      lastResultCharacters: 30_000, summaryAvailable: true
+    },
+    {
+      exchanges: 1, resultCharacters: 300_000,
+      lastResultCharacters: 300_000, summaryAvailable: false
+    },
+    {
+      exchanges: 5, resultCharacters: 100,
+      lastResultCharacters: 300_000, summaryAvailable: false
+    }
+  ])('fits large tool results when summaries cannot reduce them ($exchanges exchanges, summary available: $summaryAvailable)', async ({ exchanges, resultCharacters, lastResultCharacters, summaryAvailable }) => {
+    vi.spyOn(CONFIG_STATE.getModelState(), 'getAgentTarget').mockReturnValue({
+      provider: LLMProviders.OpenAI, model: 'gpt-6.1-sol'
+    })
+    const transcript: AgentToolTranscriptMessage[] = [
+      { role: 'user', content: 'Report the verified receipt without saving it again.' }
+    ]
+    for (let index = 0; index < exchanges; index += 1) {
+      transcript.push(
+        { role: 'assistant', content: '', toolCalls: [toolCall(`source-${index}`, CALLABLE_TOOL_NAME, { query: `source-${index}` })] },
+        { role: 'tool', toolCallId: `source-${index}`, toolName: CALLABLE_TOOL_NAME,
+          content: `Source ${index}: ${'x'.repeat(index === exchanges - 1 ? lastResultCharacters : resultCharacters)} Receipt: release-42.` }
+      )
+    }
+    const duty = new ReActLLMDuty({ input: 'Report the verified receipt.' })
+    Object.assign(duty, {
+      automaticCompactionFailed: true, continuationSummaryFailed: !summaryAvailable, writeAgentPromptLog: vi.fn()
+    })
+    coreMocks.prompt.mockImplementation(async (history, params) => ({
+      output: params.usagePurpose === InferencePurpose.ContextCompaction
+        ? String(history)
+        : 'The verified receipt is release-42.'
+    }))
+    const before = structuredClone(transcript)
+    const result = await duty['callAgentModel'](transcript, 'Follow the request.', [], {
+      isRecoveryAttempt: false, isContextRecoveryAttempt: true
+    }, {
+      originalInput: 'Report the verified receipt without saving it again.',
+      trackedSteps: [{ label: 'Save receipt', status: 'completed', details: 'Verified release-42.' }],
+      executionHistory: [{ function: 'receipt.save', status: 'success', observation: JSON.stringify({
+        status: 'success', message: 'Verified release-42.', output_log_path: '/tmp/receipt.log'
+      }) }],
+      loadedToolkitIds: [], activeSkillId: null
+    })
+
+    expect(result?.textContent).toContain('release-42')
+    expect(coreMocks.prompt).toHaveBeenCalledTimes(summaryAvailable ? 2 : 1)
+    const request = coreMocks.prompt.mock.calls.at(-1)![0] as AgentToolTranscriptMessage[]
+    expect(JSON.stringify(request).length).toBeLessThan(
+      AGENT_REMOTE_CONTEXT_RECOVERY_TRIGGER_TOKENS * CHARS_PER_TOKEN
+    )
+    if (lastResultCharacters < AGENT_REMOTE_CONTEXT_RECOVERY_TRIGGER_TOKENS * CHARS_PER_TOKEN) {
+      expect(request.at(-1)).toEqual(before.at(-1))
+    }
+    expect(JSON.stringify(request)).toContain('/tmp/receipt.log')
+    expect(JSON.stringify(request)).toContain('Save receipt')
+    expect(request[0]?.content).toBe(before[0]?.content)
+  })
+
+  it('stops irreducible context without repeating the same preparation or losing its evidence', async () => {
+    const transcript: AgentToolTranscriptMessage[] = [
+      { role: 'user', content: `Required evidence: ${'x'.repeat(500_000)}` }
+    ]
+    const duty = new ReActLLMDuty({ input: 'Analyze the supplied evidence.' })
+    Object.assign(duty, {
+      automaticCompactionFailed: true, continuationSummaryFailed: true, writeAgentPromptLog: vi.fn()
+    })
+    const before = structuredClone(transcript)
+    await expect(duty['callAgentModel'](transcript, 'Follow the request.', [], {
+      isRecoveryAttempt: false
+    })).rejects.toMatchObject({
+      failureKind: CompletionFailureKind.Context, canRetryWithCompaction: false
+    })
+
+    expect(coreMocks.prompt).not.toHaveBeenCalled()
+    expect(transcript).toEqual(before)
   })
 
   it('keeps clock and mood changes outside reusable duty rules', () => {
@@ -4797,6 +5401,9 @@ describe('model response status', () => {
     { names: [AGENT_PLAN_TOOL_NAME], goal: TurnPhase.Plan },
     { names: [AGENT_CLARIFICATION_TOOL_NAME], goal: TurnPhase.Clarification },
     { names: [AGENT_CANCELLATION_TOOL_NAME], goal: TurnPhase.Cancellation },
+    { names: ['load_ui'], goal: TurnPhase.VisualSetup },
+    { names: ['preview_ui'], goal: TurnPhase.Visual },
+    { names: ['present_ui'], goal: TurnPhase.VisualPresentation },
     { names: [CALLABLE_TOOL_NAME], goal: TurnPhase.ToolRequest },
     { names: [AGENT_TOOLKIT_LOADER_NAME, CALLABLE_TOOL_NAME], goal: TurnPhase.Request },
     { names: [], goal: TurnPhase.Answer }
@@ -5444,9 +6051,14 @@ describe('model response status', () => {
       expect(params.retryInterruptedResponse).toBe(true)
       params.onToken?.('Unfinished draft')
       for (let attempt = 1; attempt <= 5; attempt += 1) {
-        await params.onConnectionRetry?.({ attempt, maxRetries: 5, delayMs: attempt * 5_000 })
+        await params.onConnectionRetry?.({
+          attempt, maxRetries: 5, delayMs: (attempt - 1) * 5_000,
+          failureMessage: 'My connection to OpenAI stopped responding.'
+        })
         expect(coreMocks.emitAnswerToChatClients).toHaveBeenCalledWith(expect.objectContaining({
-          answer: expect.stringContaining(`Retry ${attempt}/5 in ${attempt * 5} seconds`),
+          answer: expect.stringContaining(attempt === 1
+            ? 'My connection to OpenAI stopped responding. I am reconnecting and retrying (1/5).'
+            : `My connection to OpenAI stopped responding. I will reconnect and retry (${attempt}/5) in ${(attempt - 1) * 5} seconds.`),
           historyMode: 'system_widget'
         }))
       }
@@ -5622,6 +6234,114 @@ describe('model response status', () => {
     finish({ output: 'Late result' })
     expect(coreMocks.emitAnswerToChatClients).toHaveBeenCalledTimes(count)
     expect(coreMocks.prompt).toHaveBeenCalledOnce()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('continues through growing context after stall recovery and completes review', async () => {
+    vi.spyOn(LogHelper, 'timeEnd').mockImplementation(() => {})
+    vi.spyOn(CONFIG_STATE.getModelSettingsState(), 'getSettings').mockReturnValue({
+      reasoning: 'high', speed: 'fast'
+    })
+    const attempts: { params: CompletionParams, prompt: string }[] = []
+    const sourceCount = 10
+    let requestedSources = 0
+    const runChatCompletion = vi.fn((history, params: CompletionParams) => {
+      attempts.push({ params, prompt: JSON.stringify(history) })
+      if (attempts.length <= 2) {
+        params.onStreamEvent?.({ type: 'reasoning-start' })
+        params.onReasoningToken?.('Checking saved evidence.')
+        params.onStreamEvent?.({ type: 'reasoning-end' })
+        return new Promise((_resolve, reject) => {
+          params.signal?.addEventListener('abort', () => reject(params.signal?.reason), { once: true })
+        })
+      }
+
+      const content = params.usagePurpose === InferencePurpose.ContextCompaction
+        ? 'The saved receipt is release-42. Completed source lookups are verified; report the verified receipt.'
+        : params.toolChoice === 'none'
+          ? JSON.stringify({ status: 'complete', reason: 'The saved receipt is reported.' })
+          : 'The saved receipt is release-42.'
+      params.onToken?.(content)
+      params.onStreamEvent?.({ type: 'finish' })
+      const inspectSource = params.usagePurpose !== InferencePurpose.ContextCompaction &&
+        params.toolChoice !== 'none' && requestedSources < sourceCount
+      if (inspectSource) {
+        requestedSources += 1
+      }
+      return Promise.resolve({ data: { choices: [{
+        message: {
+          content,
+          ...(inspectSource ? { tool_calls: [
+            toolCall(`inspect-${requestedSources}`, CALLABLE_TOOL_NAME, { query: `source-${requestedSources}` })
+          ] } : {})
+        },
+        finish_reason: 'stop'
+      }] } })
+    })
+    coreMocks.prompt.mockImplementation((history, params) => runCompletionAttempt(
+      { modelName: 'test-model', runChatCompletion }, LLMProviders.OpenAI, history,
+      { ...params, data: params.data ?? null, remoteProviderErrorRetries: params.remoteProviderErrorRetries ?? 3 } as PreparedCompletionParams,
+      'recovery-test', (retryParams) => coreMocks.prompt(history, retryParams), vi.fn()
+    ))
+    const transcript: AgentToolTranscriptMessage[] = [
+      { role: 'user', content: 'Report the saved receipt.' }
+    ]
+    for (let index = 0; index < 24; index += 1) {
+      transcript.push(
+        { role: 'assistant', content: '', toolCalls: [toolCall(`history-${index}`, CALLABLE_TOOL_NAME, { query: `source-${index}` })] },
+        { role: 'tool', toolCallId: `history-${index}`, toolName: CALLABLE_TOOL_NAME, content: `Historical evidence ${index}: ${'details '.repeat(300)}` }
+      )
+    }
+    transcript.push(
+      { role: 'assistant', content: '', toolCalls: [toolCall('saved', CALLABLE_TOOL_NAME, { query: 'release' })] },
+      { role: 'tool', toolCallId: 'saved', toolName: CALLABLE_TOOL_NAME, content: 'Receipt saved: release-42.' }
+    )
+    const executionHistory = [{
+      function: callable.qualifiedName, status: 'success', observation: 'Receipt saved: release-42.'
+    }]
+    const duty = new ReActLLMDuty({ input: 'Report the saved receipt.' })
+    Object.assign(duty, { writeAgentPromptLog: vi.fn() })
+    const executeFunction = vi.fn(async (_callable, toolInput) => ({
+      execution: {
+        function: callable.qualifiedName, status: 'success',
+        observation: `Verified source: ${'x'.repeat(30_000)}`,
+        requestedToolInput: JSON.stringify(toolInput)
+      }
+    }))
+    const pending = runAgentLoopWithCompletionReview({
+      transcript, catalog: createCatalog(), initialExecutionHistory: executionHistory,
+      executeFunction, loadAgentSkill: async () => null,
+      callModel: (messages, tools, options, state) => duty['callAgentModel'](
+        messages, 'Follow the request.', tools, options, {
+          originalInput: 'Report the saved receipt.',
+          trackedSteps: state.trackedSteps, executionHistory: state.executionHistory,
+          loadedToolkitIds: [], activeSkillId: null
+        }
+      )
+    })
+    await vi.advanceTimersByTimeAsync(180_001)
+    const result = await pending
+
+    expect(result.intent).toBe('answer')
+    expect(result.answer).toContain('release-42')
+    const summaries = attempts.filter(({ params }) => params.usagePurpose === InferencePurpose.ContextCompaction)
+    expect(summaries.length).toBeGreaterThan(0)
+    expect(attempts).toHaveLength(sourceCount + summaries.length + 4)
+    expect(attempts[2]?.params).toMatchObject({
+      responseTransport: 'http', reasoningEffort: 'high', maxRetries: 0,
+      remoteProviderErrorRetries: 0, connectionErrorRetries: 0, disableContextCompaction: true
+    })
+    expect(attempts[2]!.prompt.length).toBeLessThan(attempts[1]!.prompt.length)
+    expect(attempts[2]!.prompt).toContain('release-42')
+    expect(executeFunction).toHaveBeenCalledTimes(sourceCount)
+    expect(result.executionHistory).toHaveLength(sourceCount + 1)
+    expect(result.executionHistory[0]).toEqual(executionHistory[0])
+    for (const attempt of attempts.slice(2).filter(({ params }) => params.usagePurpose !== InferencePurpose.ContextCompaction)) {
+      expect(attempt.prompt.length).toBeLessThan(
+        AGENT_REMOTE_CONTEXT_RECOVERY_TRIGGER_TOKENS * CHARS_PER_TOKEN
+      )
+    }
+    expect(attempts.slice(0, 2).every(({ params }) => params.signal?.aborted)).toBe(true)
     expect(vi.getTimerCount()).toBe(0)
   })
 

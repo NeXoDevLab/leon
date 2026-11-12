@@ -3,6 +3,7 @@ import { getActiveProfileName } from '@/core/profile-runtime/profile-context'
 import { CONFIG_MANAGER } from '@/config'
 import { TOOLKIT_REGISTRY } from '@/core'
 import { OAUTH_APPLICATION_STORE } from './connection-store'
+import { getPreferredConnectionMethod } from '@@/aurora/src/contracts/connection-setup'
 
 /**
  * Limits runtime credentials to the fields declared by the tool.
@@ -102,7 +103,8 @@ export async function getOAuthClientSettings(
  */
 export function getConnectionCallbackURL(
   origin: string,
-  apiVersion: string
+  apiVersion: string,
+  resource: 'connections' | 'tools' = 'connections'
 ): string {
   const publicURL = CONFIG_MANAGER.getConfig().server.public_url || origin
   const base = new URL(publicURL)
@@ -111,7 +113,7 @@ export function getConnectionCallbackURL(
     base.pathname += '/'
   }
 
-  const url = new URL(`api/${apiVersion}/connections/oauth/callback`, base)
+  const url = new URL(`api/${apiVersion}/${resource}/oauth/callback`, base)
 
   // Numeric loopback addresses work with providers that reject localhost redirects.
   if (url.hostname === 'localhost') {
@@ -232,6 +234,7 @@ export async function getConnectionRequirements(
       return {
         provider,
         name: tool.name,
+        recommended_method: getPreferredConnectionMethod(tool.methods)?.id,
         connected: !TOOLKIT_REGISTRY.needsToolConnection(
           tool.toolkit_id,
           tool.tool_id
